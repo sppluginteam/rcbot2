@@ -545,7 +545,12 @@ public:
 		return CBot::hurt(pAttacker,iHealthNow,bDontHide);
 	}
 
-	//virtual void chooseClass(); //virtual so CBotFF can pick with FF-correct team/role logic [APG]RoboCop[CL]
+	// Picks the class the bot wants to play (writes m_iDesiredClass).
+	// Virtual so CBotFF (and any other fortress variant) can pick with
+	// mod-correct team/role logic. [APG]RoboCop[CL]
+	// Keep this declared: it is defined in bot_fortress.cpp and called from
+	// CBotFortress::startGame(), CBotTF2::changeClass() and CBotFF::startGame().
+	virtual void chooseClass();
 
 	virtual TF_Class getClass () { return TF_CLASS_UNDEFINED; }
 
@@ -1109,7 +1114,12 @@ public:
 
 	TF_Class getClass() override;
 
-	void chooseClass() override;
+	// NOTE: no chooseClass() override here - Fortress Forever uses the same
+	// 1..9 class range as TF2, so CBotFortress::chooseClass() is reused to
+	// fill m_iDesiredClass. The FF-specific part is CBotFF::selectClass(),
+	// which turns that choice into the "class <name>" command.
+	// Re-declaring it with 'override' but never defining it breaks the build
+	// (C3668 / "only virtual member functions can be marked 'override'").
 
 protected:
 	void selectTeam() override;
