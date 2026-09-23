@@ -376,10 +376,19 @@ jobs:
       - name: Publish continuous release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Belt and braces: GH_REPO makes every gh subcommand in this step
+          # resolve the repository even without --repo.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           SHA="${{ steps.short-sha.outputs.sha }}"
           TAG=continuous
+          # This job never checks out the repo, so there is no .git directory.
+          # gh needs it to work out which repository to talk to - without
+          # --repo it dies with:
+          #   failed to run git: fatal: not a git repository ... .git
+          # Passing --repo explicitly lets it run from a bare workspace.
+          REPO="${{ github.repository }}"
 
           {
             echo "Automated rolling build of \`master\` at \`${GITHUB_SHA}\`."
@@ -403,9 +412,16 @@ jobs:
 
           # Replace the previous rolling release. --cleanup-tag also drops the
           # tag so it can be recreated pointing at this commit.
-          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          # Only skip when it genuinely does not exist yet; a real failure
+          # (bad token, wrong perms) must not be silently swallowed.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag
+          else
+            echo "No existing '$TAG' release - creating it for the first time."
+          fi
 
           gh release create "$TAG" \
+            --repo "$REPO" \
             --target "${GITHUB_SHA}" \
             --title "RCBot2 continuous (${SHA})" \
             --prerelease \
