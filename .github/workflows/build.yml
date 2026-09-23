@@ -2,6 +2,13 @@ name: Build
 
 on: ["push", "workflow_dispatch"]
 
+# Queue runs on the same ref instead of cancelling them. The release job
+# deletes and recreates the rolling release, so cancelling a run half way
+# through could leave it missing.
+concurrency:
+  group: rcbot2-build-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build_main:
     name: Build for ${{ matrix.os_short }}
@@ -251,3 +258,156 @@ jobs:
             rcbot2-win64-${{ steps.short-sha.outputs.sha }}
             rcbot2-dbgsym-win32-${{ steps.short-sha.outputs.sha }}
             rcbot2-dbgsym-win64-${{ steps.short-sha.outputs.sha }}
+
+  # ---------------------------------------------------------------------------
+  # Rolling release. Every push to master republishes the single "continuous"
+  # release: one full addons tree plus one bin-only bundle per game/mod.
+  # Only the combined Windows artifact is used here - combine_windows deletes
+  # the individual win32/win64 ones.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish rolling release
+    needs: [build_main, combine_windows]
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Short SHA
+        id: short-sha
+        run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: rcbot2-linux-${{ steps.short-sha.outputs.sha }}
+          path: dl/linux
+
+      - name: Download Windows combined artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: rcbot2-windows-${{ steps.short-sha.outputs.sha }}
+          path: dl/windows
+
+      - name: Build release archives
+        id: pack
+        run: |
+          set -euo pipefail
+          SHA="${{ steps.short-sha.outputs.sha }}"
+          STAGE=stage
+          OUT=release
+          rm -rf "$STAGE" "$OUT" pack
+          mkdir -p "$STAGE" "$OUT" pack
+
+          BIN="$STAGE/addons/rcbot2/bin"
+          BIN64="$STAGE/addons/rcbot2/bin/x64"
+
+          # --- 1. Full addons tree -------------------------------------------
+          # The Linux artifact is the base: it already carries both x86 and
+          # x86_64 binaries plus every non-binary file (vdf, config, ...).
+          cp -a dl/linux/addons "$STAGE/addons"
+          mkdir -p "$BIN" "$BIN64"
+
+          # Overlay the Windows DLLs:
+          #   win32 -> bin/      RCBot2Meta.dll, rcbot.2.<mod>.dll (x86)
+          #   win64 -> bin/      RCBot2Meta.x64.dll
+          #   win64 -> bin/x64/  rcbot.2.<mod>.dll (x86_64)
+          if compgen -G "dl/windows/win32/addons/rcbot2/bin/*.dll" > /dev/null; then
+            cp -a dl/windows/win32/addons/rcbot2/bin/*.dll "$BIN/"
+          fi
+          if compgen -G "dl/windows/win64/addons/rcbot2/bin/*.dll" > /dev/null; then
+            cp -a dl/windows/win64/addons/rcbot2/bin/*.dll "$BIN/"
+          fi
+          if compgen -G "dl/windows/win64/addons/rcbot2/bin/x64/*.dll" > /dev/null; then
+            cp -a dl/windows/win64/addons/rcbot2/bin/x64/*.dll "$BIN64/"
+          fi
+
+          (cd "$STAGE" && zip -qr "../$OUT/rcbot2-addons-$SHA.zip" addons)
+
+          # --- 2. Discover the mods that were actually built ------------------
+          # No hardcoded list: adding an SDK to .gitmodules automatically adds
+          # its release archive.
+          mapfile -t MODS < <(
+            find "$BIN" -maxdepth 2 -type f -name 'rcbot.2.*' -printf '%f\n' \
+              | sed -E 's/^rcbot\.2\.//; s/\.(so|dll|dylib)$//' \
+              | sort -u
+          )
+          if [ "${#MODS[@]}" -eq 0 ]; then
+            echo "::error::No rcbot.2.* binaries found - nothing to package"
+            exit 1
+          fi
+          echo "Discovered mods: ${MODS[*]}"
+
+          # --- 3. Per-mod bundles --------------------------------------------
+          # bin/ + bin/x64/ for that mod only, plus the Metamod loaders.
+          for mod in "${MODS[@]}"; do
+            root="pack/$mod/bin"
+            mkdir -p "$root"
+
+            if compgen -G "$BIN/RCBot2Meta*" > /dev/null; then
+              cp -a "$BIN"/RCBot2Meta* "$root/"
+            fi
+            if compgen -G "$BIN/rcbot.2.$mod.*" > /dev/null; then
+              cp -a "$BIN"/rcbot.2."$mod".* "$root/"
+            fi
+            # Only create bin/x64 when the mod really has 64-bit binaries,
+            # otherwise the archive gets an empty directory entry.
+            if compgen -G "$BIN64/rcbot.2.$mod.*" > /dev/null; then
+              mkdir -p "$root/x64"
+              cp -a "$BIN64"/rcbot.2."$mod".* "$root/x64/"
+            fi
+
+            (cd "pack/$mod" && zip -qr "../../$OUT/rcbot2-$mod-$SHA.zip" bin)
+          done
+
+          (cd "$OUT" && sha256sum *.zip > SHA256SUMS.txt)
+          echo "mods=${MODS[*]}" >> "$GITHUB_OUTPUT"
+          echo "--- release/ ---"
+          ls -l "$OUT"
+
+      # Keeps the archives reachable even if the release step fails.
+      - name: Upload release archives
+        uses: actions/upload-artifact@v7
+        with:
+          name: rcbot2-release-${{ steps.short-sha.outputs.sha }}
+          path: release/*
+
+      - name: Publish continuous release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHA="${{ steps.short-sha.outputs.sha }}"
+          TAG=continuous
+
+          {
+            echo "Automated rolling build of \`master\` at \`${GITHUB_SHA}\`."
+            echo
+            echo "**Mods built:** ${{ steps.pack.outputs.mods }}"
+            echo
+            echo "| Archive | Contents |"
+            echo "|---|---|"
+            echo "| \`rcbot2-addons-$SHA.zip\` | Full \`addons/\` tree - Windows + Linux, x86 + x86_64 |"
+            for mod in ${{ steps.pack.outputs.mods }}; do
+              echo "| \`rcbot2-$mod-$SHA.zip\` | \`bin/\` + \`bin/x64/\` for \`$mod\` only |"
+            done
+            echo
+            echo "\`rcbot2-<mod>.zip\` drops into an existing install; \`rcbot2-addons.zip\`"
+            echo "is the complete package (unzip into the game folder so you get"
+            echo "\`addons/metamod/rcbot2.vdf\` and \`addons/rcbot2/\`)."
+            echo
+            echo "Debug symbols are published as the \`rcbot2-dbgsym-*-${SHA}\`"
+            echo "workflow artifacts."
+          } > notes.md
+
+          # Replace the previous rolling release. --cleanup-tag also drops the
+          # tag so it can be recreated pointing at this commit.
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+
+          gh release create "$TAG" \
+            --target "${GITHUB_SHA}" \
+            --title "RCBot2 continuous (${SHA})" \
+            --prerelease \
+            --notes-file notes.md \
+            release/*.zip release/SHA256SUMS.txt
