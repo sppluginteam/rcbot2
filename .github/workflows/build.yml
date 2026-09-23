@@ -16,7 +16,7 @@ jobs:
       matrix:
         os:
           - linux
-          - windows-x32
+          - windows-x86
           - windows-x64
         include:
           # Built inside Debian 12 rather than on the runner image directly.
@@ -36,7 +36,9 @@ jobs:
             vs_arch: unused
             am_arch: x86,x86_64
 
-          - os: windows-x32
+          # vsdevcmd.bat's -arch only accepts x86 / x64 (x32 is not a valid
+          # value), so the 32-bit job must ask for x86 like everyone else.
+          - os: windows-x86
             os_short: win32
             os_version: windows-latest
             container: ''
@@ -44,7 +46,7 @@ jobs:
             dbg_ext: pdb
             cc: not-used
             cxx: not-used
-            vs_arch: x32
+            vs_arch: x86
             am_arch: x86
 
           - os: windows-x64
@@ -142,7 +144,7 @@ jobs:
           --sm-path="$REPO_ROOT/alliedmodders/sourcemod" \
           --hl2sdk-root="$REPO_ROOT/alliedmodders" \
           --symbol-files \
-          --target ${{ matrix.am_arch }} \
+          --targets ${{ matrix.am_arch }} \
           --enable-optimize
         ambuild
 
