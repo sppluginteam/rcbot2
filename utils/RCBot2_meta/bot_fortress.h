@@ -545,11 +545,7 @@ public:
 		return CBot::hurt(pAttacker,iHealthNow,bDontHide);
 	}
 
-	// FIX: this declaration was commented out while CBotFF::chooseClass() still
-	// carries the `override` specifier, which is a hard compile error
-	// ("marked 'override', but does not override") and broke every build.
-	// Restored. [buildfix]
-	virtual void chooseClass ();
+	//virtual void chooseClass(); //virtual so CBotFF can pick with FF-correct team/role logic [APG]RoboCop[CL]
 
 	virtual TF_Class getClass () { return TF_CLASS_UNDEFINED; }
 
