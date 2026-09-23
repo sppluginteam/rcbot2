@@ -1,0 +1,67 @@
+# RCBot2 DoD:S crash-hardening patch
+
+This patch is intentionally kept separate from the build scripts so it can be reviewed and applied independently.
+
+```diff
+--- a/utils/RCBot2_meta/bot_dod_bot.cpp
++++ b/utils/RCBot2_meta/bot_dod_bot.cpp
+@@
+ void CDODBot :: changeClass ()
+ {
+ 	const int iTeam = getTeam();
++	const int iClass = m_iDesiredClass;
++	// Teams are indexed as 2/3 and classes are 1..6.  Never use either
++	// gameplay value directly as an array index.
++	if ((iTeam < TEAM_ALLIES || iTeam > TEAM_AXIS) || iClass < 1 || iClass > 6 ||
++		m_pEdict == nullptr || helpers == nullptr || engine == nullptr)
++	{
++		logger->Log(LogLevel::WARN, "DOD changeClass skipped: team=%d class=%d", iTeam, iClass);
++		m_fChangeClassTime = engine != nullptr ? engine->Time() + 1.0f : 0.0f;
++		return;
++	}
+ 	// change class
+-	helpers->ClientCommand(m_pEdict,g_DODClassCmd[iTeam-2][m_iDesiredClass]);
++	helpers->ClientCommand(m_pEdict,g_DODClassCmd[iTeam-2][iClass-1]);
+@@
+-				if ( randomFloat(0.0f,1.0f) > (scoreValue / CDODMod::getHighestScore()) )
++				const int highestScore = CDODMod::getHighestScore();
++				if ( highestScore <= 0 || randomFloat(0.0f,1.0f) > (scoreValue / highestScore) )
+***
+--- a/utils/RCBot2_meta/bot_buttons.cpp
++++ b/utils/RCBot2_meta/bot_buttons.cpp
+@@
+ int CBotButtons :: getBitMask () const
+ {
+-	if ( m_bLetGoAll )
++	if ( m_bLetGoAll || engine == nullptr )
+ 		return 0;
+@@
+ 	for (CBotButton* const m_theButton : m_theButtons)
+ 	{
++		if (m_theButton == nullptr)
++			continue;
+***
+--- a/utils/RCBot2_meta/bot.cpp
++++ b/utils/RCBot2_meta/bot.cpp
+@@
+ void CBot :: doButtons ()
+ {
++	if (m_pButtons == nullptr)
++	{
++		m_iButtons = 0;
++		return;
++	}
+ 	m_iButtons = m_pButtons->getBitMask();
+ }
+***
+--- a/utils/RCBot2_meta/bot_plugin_meta.cpp
++++ b/utils/RCBot2_meta/bot_plugin_meta.cpp
+@@
+ void RCBotPluginMeta::Hook_PlayerRunCmd(CUserCmd *ucmd, IMoveHelper *moveHelper)
+ {
++	if (ucmd == nullptr || servergameents == nullptr)
++		RETURN_META(MRES_IGNORED);
+***
+```
+
+The most important correction is `m_iDesiredClass - 1`: the existing code indexes a six-element array with class values 1..6, so class 6 reads past the row. The team/class validation also protects the call made from `startGame()` and `modThink()` when the bot is between team transitions or has stale state.
