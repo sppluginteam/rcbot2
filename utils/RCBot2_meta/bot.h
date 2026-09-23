@@ -400,6 +400,11 @@ public:
 	// setup buttons and data structures
 	virtual void setup ();
 
+	// (Re-)create any missing per-bot sub-system (buttons, schedules,
+	// navigator, visibles, ...). Safe to call at any time: only null pointers
+	// are allocated. [crashfix]
+	void ensureSubsystems ();
+
     /*
 	 * runPlayerMove()
 	 *

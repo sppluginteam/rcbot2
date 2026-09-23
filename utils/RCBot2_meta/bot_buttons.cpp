@@ -88,7 +88,12 @@ CBotButtons :: CBotButtons()
 void CBotButtons :: holdButton (const int iButtonId, const float fFrom, const float fFor, const float fLetGoTime) const
 {
 	for (CBotButton* const m_theButton : m_theButtons)
-	{			
+	{
+		// FIX: never dereference a null button slot (defensive against a
+		// corrupted / partially freed button list). [crashfix]
+		if (m_theButton == nullptr )
+			continue;
+
 		if (m_theButton->getID() == iButtonId )
 		{
 			m_theButton->hold(fFrom,fFor,fLetGoTime);
@@ -100,7 +105,10 @@ void CBotButtons :: holdButton (const int iButtonId, const float fFrom, const fl
 void CBotButtons :: letGo (const int iButtonId) const
 {
 	for (CBotButton* const m_theButton : m_theButtons)
-	{			
+	{
+		if (m_theButton == nullptr )
+			continue;
+
 		if (m_theButton->getID() == iButtonId )
 		{
 			m_theButton->letGo();
@@ -115,10 +123,22 @@ int CBotButtons :: getBitMask () const
 		return 0;
 	int iBitMask = 0;
 
+	// FIX: engine interface must be present before it is dereferenced.
+	if ( engine == nullptr )
+		return 0;
+
 	const float fTime = engine->Time();
 
 	for (CBotButton* const m_theButton : m_theButtons)
 	{
+		// FIX: this was the reported crash site (bot_buttons.cpp:102 in the
+		// shipped build). The bot's button list had already been torn down by
+		// CBot::freeMapMemory() (map change / level shutdown) while the bot was
+		// still flagged in-use, or the CBotButtons instance itself was already
+		// deleted. Skip null slots instead of dereferencing them. [crashfix]
+		if ( m_theButton == nullptr )
+			continue;
+
 		if (m_theButton->held(fTime) )
 		{
 			m_theButton->unTap();
@@ -131,8 +151,14 @@ int CBotButtons :: getBitMask () const
 
 bool CBotButtons :: canPressButton (const int iButtonId) const
 {
+	if ( engine == nullptr )
+		return false;
+
 	for (const CBotButton* m_theButton : m_theButtons)
-	{			
+	{
+		if (m_theButton == nullptr )
+			continue;
+
 		if (m_theButton->getID() == iButtonId )
 			return m_theButton->canPress(engine->Time());
 	}
@@ -141,13 +167,24 @@ bool CBotButtons :: canPressButton (const int iButtonId) const
 
 void CBotButtons :: add ( CBotButton *theButton )
 {
+	// FIX: refuse to store a null button; a null slot is what used to be
+	// dereferenced in getBitMask(). [crashfix]
+	if ( theButton == nullptr )
+		return;
+
 	m_theButtons.emplace_back(theButton);
 }
 
 bool CBotButtons :: holdingButton (const int iButtonId) const
 {
+	if ( engine == nullptr )
+		return false;
+
 	for (const CBotButton* m_theButton : m_theButtons)
 	{
+		if (m_theButton == nullptr )
+			continue;
+
 		if (m_theButton->getID() == iButtonId )
 			return m_theButton->held(engine->Time());
 	}
@@ -159,6 +196,9 @@ void CBotButtons :: tap (const int iButtonId) const
 {
 	for (CBotButton* const m_theButton : m_theButtons)
 	{
+		if (m_theButton == nullptr )
+			continue;
+
 		if (m_theButton->getID() == iButtonId )
 		{
 			m_theButton->tap();

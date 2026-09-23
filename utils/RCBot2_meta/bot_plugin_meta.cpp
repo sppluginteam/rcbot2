@@ -356,31 +356,42 @@ void RCBotPluginMeta::Hook_PlayerRunCmd(CUserCmd *ucmd, IMoveHelper *moveHelper)
 	VPROF_BUDGET("RCBotPluginMeta::Hook_PlayerRunCmd", "RCBot2")
 #endif // RCBOT_VPROF_ENABLED
 
-	static CBot *pBot;
+	// [FIX] Crash3: this vtable hook can fire for a player whose entity is being
+	// torn down (disconnect/level change) before Hook_ClientDisconnect removes the
+	// hook, and ucmd/moveHelper are not guaranteed non-null by the engine on every
+	// call path. Previously servergameents/pPlayer/ucmd were dereferenced with no
+	// checks -> null/use-after-free crash. Also drop the function-local statics so
+	// a previous bot's pointer can never be mistaken for the current one.
+	if ( servergameents == nullptr )
+		RETURN_META(MRES_IGNORED);
 
 	CBaseEntity *pPlayer = META_IFACEPTR(CBaseEntity);
 
+	if ( pPlayer == nullptr )
+		RETURN_META(MRES_IGNORED);
+
 	const edict_t *pEdict = servergameents->BaseEntityToEdict(pPlayer);
 
-	pBot = CBots::getBotPointer(pEdict);
-	
-	if ( pBot )
-	{
-		static CBotCmd *cmd;
-		
-		cmd = pBot->getUserCMD();
+	CBot *pBot = CBots::getBotPointer(pEdict);
 
-		// put the bot's commands into this move frame
-		ucmd->buttons = cmd->buttons;
-		ucmd->forwardmove = cmd->forwardmove;
-		ucmd->impulse = cmd->impulse;
-		ucmd->sidemove = cmd->sidemove;
-		ucmd->upmove = cmd->upmove;
-		ucmd->viewangles = cmd->viewangles;
-		ucmd->weaponselect = cmd->weaponselect;
-		ucmd->weaponsubtype = cmd->weaponsubtype;
-		ucmd->tick_count = cmd->tick_count;
-		ucmd->command_number = cmd->command_number;
+	if ( pBot && ucmd )
+	{
+		CBotCmd *cmd = pBot->getUserCMD();
+
+		if ( cmd != nullptr )
+		{
+			// put the bot's commands into this move frame
+			ucmd->buttons = cmd->buttons;
+			ucmd->forwardmove = cmd->forwardmove;
+			ucmd->impulse = cmd->impulse;
+			ucmd->sidemove = cmd->sidemove;
+			ucmd->upmove = cmd->upmove;
+			ucmd->viewangles = cmd->viewangles;
+			ucmd->weaponselect = cmd->weaponselect;
+			ucmd->weaponsubtype = cmd->weaponsubtype;
+			ucmd->tick_count = cmd->tick_count;
+			ucmd->command_number = cmd->command_number;
+		}
 	}
 	RETURN_META(MRES_IGNORED);
 }

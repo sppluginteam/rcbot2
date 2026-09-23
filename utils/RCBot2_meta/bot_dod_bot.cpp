@@ -60,7 +60,14 @@
 #include <tier0/vprof.h>
 #endif // RCBOT_VPROF_ENABLED
 
-const char *g_DODClassCmd[2][6] = 
+// Number of selectable DoD:S player classes (rifleman .. rocket). The in-game
+// player class property is 0-based, so class indices must always stay within
+// [0, DOD_NUM_CLASSES). [crashfix]
+constexpr int DOD_NUM_CLASSES = 6;
+// Teams are 2 (allies) and 3 (axis) -> table rows 0 and 1. [crashfix]
+constexpr int DOD_NUM_TEAMS = 2;
+
+const char *g_DODClassCmd[DOD_NUM_TEAMS][DOD_NUM_CLASSES] = 
 { {"cls_garand","cls_tommy","cls_bar","cls_spring","cls_30cal","cls_bazooka"},
 {"cls_k98","cls_mp40","cls_mp44","cls_k98s","cls_mg42","cls_pschreck"} };
 
@@ -333,12 +340,17 @@ bool CDODBot :: startGame ()
 
 	static int iTeam;
 
+	// FIX: never dereference a null player info / invalid edict; both can be
+	// gone while a bot is being removed or during a map change. [crashfix]
+	if ( m_pPlayerInfo == nullptr || !CBotGlobals::entityIsValid(m_pEdict) )
+		return false;
+
 	iTeam = m_pPlayerInfo->GetTeamIndex();
 
 	// not joined a team?
-	if ( (iTeam != 2) && (iTeam != 3) )
+	if ( (iTeam != TEAM_ALLIES) && (iTeam != TEAM_AXIS) )
 	{
-		if ( (m_iDesiredTeam == 2) || (m_iDesiredTeam == 3) )
+		if ( (m_iDesiredTeam == TEAM_ALLIES) || (m_iDesiredTeam == TEAM_AXIS) )
 			m_pPlayerInfo->ChangeTeam(m_iDesiredTeam);
 		else
 		{
@@ -352,14 +364,16 @@ bool CDODBot :: startGame ()
 		return false;
 	}
 
-	if ( (m_iDesiredClass < 0) || (m_iDesiredClass > 5) )
+	// FIX: keep the desired class inside the valid 0-based range; chooseClass()
+	// now guarantees it, but validate before it is used as a table index.
+	if ( (m_iDesiredClass < 0) || (m_iDesiredClass >= DOD_NUM_CLASSES) )
 		chooseClass(false);
 
 	if (CClassInterface::getPlayerClassDOD(m_pEdict) < 0)
 		return false;
 
 	// not the correct class? and desired class is valid?
-	if ( (m_iDesiredClass >= 0) && (m_iDesiredClass <= 5) && (m_iDesiredClass != CClassInterface::getPlayerClassDOD(m_pEdict)) )
+	if ( (m_iDesiredClass >= 0) && (m_iDesiredClass < DOD_NUM_CLASSES) && (m_iDesiredClass != CClassInterface::getPlayerClassDOD(m_pEdict)) )
 	{
 		// Sanity check: Prevent spamming joinclass every frame [APG]RoboCop[CL]
 		if ( m_fChangeClassTime < engine->Time() )
@@ -1087,10 +1101,48 @@ void CDODBot :: touchedWpt ( CWaypoint *pWaypoint, const int iNextWaypoint, cons
 
 void CDODBot :: changeClass ()
 {
+	// FIX: this function was the reported crash
+	// "CDODBot::changeClass() [bot_dod_bot.cpp:1047] <- CDODBot::startGame()".
+	//
+	// The old body indexed the class command table with
+	// g_DODClassCmd[iTeam-2][m_iDesiredClass] without any validation:
+	//   * getTeam() may return 0 (unassigned) / 1 (spectator) or any other
+	//     value while the bot is joining, giving a negative / out of range row.
+	//   * m_iDesiredClass is fed by chooseClass() which, for the
+	//     rcbot_force_class path, stored the 1-based DOD_CLASS_* values
+	//     (1..6) while the table only has 6 columns (0..5) -> index 6 read
+	//     past the end of the array and the server crashed on the bogus
+	//     command string pointer.
+	// Validate both indices (and the edict) before issuing the command.
+	// [crashfix]
 	const int iTeam = getTeam();
+
+	// bot must be on a playing team (2 = allies, 3 = axis)
+	if ( (iTeam != TEAM_ALLIES) && (iTeam != TEAM_AXIS) )
+	{
+		logger->Log(LogLevel::WARN, "%s : changeClass() skipped, not on a team (team %d)", m_szBotName, iTeam);
+		return;
+	}
+
+	// player info may vanish between frames
+	if ( m_pEdict == nullptr || !CBotGlobals::entityIsValid(m_pEdict) || helpers == nullptr )
+		return;
+
+	// class index must be a valid 0-based player class
+	if ( (m_iDesiredClass < 0) || (m_iDesiredClass >= DOD_NUM_CLASSES) )
+	{
+		chooseClass(false);
+
+		if ( (m_iDesiredClass < 0) || (m_iDesiredClass >= DOD_NUM_CLASSES) )
+		{
+			logger->Log(LogLevel::WARN, "%s : changeClass() skipped, invalid class %d", m_szBotName, m_iDesiredClass);
+			return;
+		}
+	}
+
 	// change class
 	//selectClass();
-	helpers->ClientCommand(m_pEdict,g_DODClassCmd[iTeam-2][m_iDesiredClass]);
+	helpers->ClientCommand(m_pEdict,g_DODClassCmd[iTeam - TEAM_ALLIES][m_iDesiredClass]);
 
 	m_fChangeClassTime = engine->Time() + randomFloat(bot_min_cc_time.GetFloat(),bot_max_cc_time.GetFloat());
 }
@@ -1100,44 +1152,37 @@ void CDODBot :: chooseClass (const bool bIsChangingClass)
 	const int _forcedClass = rcbot_force_class.GetInt();
 	if (_forcedClass > 0 && _forcedClass < 10)
 	{
-		switch (_forcedClass)
-		{
-		case 1:
-			m_iDesiredClass = DOD_CLASS_RIFLEMAN;
-			break;
-		case 2:
-			m_iDesiredClass = DOD_CLASS_ASSAULT;
-			break;
-		case 3:
-			m_iDesiredClass = DOD_CLASS_SUPPORT;
-			break;
-		case 4:
-			m_iDesiredClass = DOD_CLASS_SNIPER;
-			break;
-		case 5:
-			m_iDesiredClass = DOD_CLASS_MACHINEGUNNER;
-			break;
-		case 6:
-			m_iDesiredClass = DOD_CLASS_ROCKET;
-			break;
-		}
+		// FIX: rcbot_force_class is documented with the 1-based DOD_CLASS_*
+		// numbering (1 = rifleman .. 6 = rocket), but m_iDesiredClass is a
+		// 0-based player class index (0..5) - it is compared against
+		// CClassInterface::getPlayerClassDOD() and used as the column index of
+		// g_DODClassCmd. Storing the raw enum shifted every forced class by one
+		// (rifleman -> tommy/mp40, ...) and, for value 6, produced the
+		// out-of-bounds index that crashed changeClass(). [crashfix]
+		if ( (_forcedClass >= DOD_CLASS_RIFLEMAN) && (_forcedClass <= DOD_CLASS_ROCKET) )
+			m_iDesiredClass = _forcedClass - 1;
 	}
 	else
 	{
-		std::array<float, 7U> fClassFitness{ 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+		// FIX: only the 6 real classes are weighted; the previous 7th element
+		// added a "phantom" class to the total fitness and skewed the random
+		// pick. Class weighting is now indexed 0-based like the class itself.
+		// [crashfix]
+		std::array<float, DOD_NUM_CLASSES> fClassFitness{};
+		fClassFitness.fill(1.0f);
 		float fTotalFitness = 0;
 
 		const int iTeam = getTeam();
 
 		//TODO: allow bots to choose less heavy classes [APG]RoboCop[CL]
-		fClassFitness[DOD_CLASS_RIFLEMAN] *= 1.5f;
-		fClassFitness[DOD_CLASS_ASSAULT] *= 1.2f;
-		fClassFitness[DOD_CLASS_SUPPORT] *= 1.0f;
-		fClassFitness[DOD_CLASS_SNIPER] *= 0.6f;
-		fClassFitness[DOD_CLASS_MACHINEGUNNER] *= 0.8f;
-		fClassFitness[DOD_CLASS_ROCKET] *= 0.5f;
+		fClassFitness[DOD_CLASS_RIFLEMAN - 1] *= 1.5f;
+		fClassFitness[DOD_CLASS_ASSAULT - 1] *= 1.2f;
+		fClassFitness[DOD_CLASS_SUPPORT - 1] *= 1.0f;
+		fClassFitness[DOD_CLASS_SNIPER - 1] *= 0.6f;
+		fClassFitness[DOD_CLASS_MACHINEGUNNER - 1] *= 0.8f;
+		fClassFitness[DOD_CLASS_ROCKET - 1] *= 0.5f;
 
-		if (bIsChangingClass && (m_iClass < 6))
+		if (bIsChangingClass && (m_iClass < DOD_NUM_CLASSES))
 			fClassFitness[m_iClass] = 0.1f;
 
 		for (int i = 1; i <= gpGlobals->maxClients; i++)
@@ -1162,7 +1207,7 @@ void CDODBot :: chooseClass (const bool bIsChangingClass)
 
 		m_iDesiredClass = 0;
 
-		for (int i = 0; i < 6; i++)
+		for (int i = 0; i < DOD_NUM_CLASSES; i++)
 		{
 			fTotalFitness += fClassFitness[i];
 
@@ -1173,6 +1218,12 @@ void CDODBot :: chooseClass (const bool bIsChangingClass)
 			}
 		}
 	}
+
+	// FIX: final guard - whatever path was taken above, the desired class must
+	// always be a valid 0-based player class, otherwise changeClass() would
+	// index g_DODClassCmd out of bounds. [crashfix]
+	if ( (m_iDesiredClass < 0) || (m_iDesiredClass >= DOD_NUM_CLASSES) )
+		m_iDesiredClass = 0;
 }
 
 void CDODBot :: prone ()

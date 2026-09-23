@@ -310,10 +310,27 @@ void CBot :: setEdict (edict_t *pEdict)
 
 	if ( m_pEdict )
 	{
-		m_pPlayerInfo = playerinfomanager->GetPlayerInfo(m_pEdict);
-		m_pController = g_pBotManager->GetBotController(m_pEdict);		
-		std::strncpy(m_szBotName,m_pPlayerInfo->GetName(),63);
-		m_szBotName[63]=0;
+		// FIX: player info / bot controller are not guaranteed to be available
+		// the moment a fake client is created (early connect, engine not ready).
+		// The old code dereferenced both unconditionally and could take the
+		// server down with them. [crashfix]
+		m_pPlayerInfo = (playerinfomanager != nullptr) ? playerinfomanager->GetPlayerInfo(m_pEdict) : nullptr;
+		m_pController = (g_pBotManager != nullptr) ? g_pBotManager->GetBotController(m_pEdict) : nullptr;
+
+		if ( m_pPlayerInfo != nullptr )
+		{
+			const char *pszName = m_pPlayerInfo->GetName();
+
+			if ( pszName != nullptr )
+			{
+				std::strncpy(m_szBotName,pszName,63);
+				m_szBotName[63]=0;
+			}
+			else
+				m_szBotName[0] = 0;
+		}
+		else
+			m_szBotName[0] = 0;
 	}
 	else
 	{
@@ -813,8 +830,28 @@ void CBot :: think ()
 	// re-added
 	if ( !CBotGlobals::entityIsValid(m_pEdict) || m_pPlayerInfo == nullptr)
 	{
-		m_pPlayerInfo = playerinfomanager->GetPlayerInfo(m_pEdict);
+		// FIX: playerinfomanager / edict can be invalid here (bot kicked, map
+		// change in progress), don't dereference them blindly. [crashfix]
+		if ( CBotGlobals::entityIsValid(m_pEdict) && playerinfomanager != nullptr )
+			m_pPlayerInfo = playerinfomanager->GetPlayerInfo(m_pEdict);
+
 		logger->Log(LogLevel::INFO, "%s : m_pPlayerInfo = NULL; Waiting for player info...", m_szBotName);
+		return;
+	}
+
+	// FIX: the per-bot sub-systems (buttons, schedules, navigator, ...) are
+	// destroyed by CBot::freeMapMemory() on level shutdown / map change while
+	// the bot stays flagged as in-use. The very next GameFrame used to run the
+	// whole AI with dangling pointers and crashed in
+	// CBotButtons::getBitMask(). Re-create anything that is missing before the
+	// AI touches it. [crashfix]
+	ensureSubsystems();
+
+	// FIX: profile data is used unconditionally further down (aim skill,
+	// braveness, ...). Bail out instead of dereferencing a null profile.
+	if ( m_pProfile == nullptr )
+	{
+		logger->Log(LogLevel::WARN, "%s : bot profile missing, skipping think", m_szBotName);
 		return;
 	}
 
@@ -1173,6 +1210,12 @@ void CBot :: init (const bool bVarInit)
 	m_pWeapons = nullptr;
 	m_fTimeCreated = 0;	
 	m_pProfile = nullptr;
+	// FIX: these were never initialised, so a bot that failed to be created
+	// from a profile (or a re-used bot object) carried garbage into
+	// CDODBot::changeClass(), where the desired class is used as an array
+	// index. -1 is the documented "invalid class" marker. [crashfix]
+	m_iDesiredTeam = -1;
+	m_iDesiredClass = -1;
 	m_szBotName[0] = 0;
 	m_fIdealMoveSpeed = 320;
 	m_fFov = BOT_DEFAULT_FOV;
@@ -1589,21 +1632,41 @@ void CBot :: updateDanger (const float fBelief)
 { 
 	m_fCurrentDanger = m_fCurrentDanger * m_pProfile->m_fBraveness + fBelief * (1.0f - m_pProfile->m_fBraveness); 
 }
+// (Re-)create any per-bot sub-system that is missing.
+//
+// FIX: every one of these pointers is deleted and nulled by
+// CBot::freeMapMemory() on level shutdown / map change, but the bot itself
+// stays flagged as in-use (m_bUsed / m_pEdict are kept). When the next map
+// starts, or when GameFrame runs again before the bot is removed, the AI used
+// to run with null / dangling sub-systems and crashed (see
+// CBotButtons::getBitMask()). Allocating only what is actually missing keeps
+// the original setup behaviour and is safe to call from think(). [crashfix]
+void CBot :: ensureSubsystems ()
+{
+	/////////////////////////////////
+	if ( m_pButtons == nullptr )
+		m_pButtons = new CBotButtons();
+	/////////////////////////////////
+	if ( m_pSchedules == nullptr )
+		m_pSchedules = new CBotSchedules();
+	/////////////////////////////////
+	if ( m_pNavigator == nullptr )
+		m_pNavigator = new CWaypointNavigator(this);
+	/////////////////////////////////
+	if ( m_pVisibles == nullptr )
+		m_pVisibles = new CBotVisibles(this);
+	/////////////////////////////////
+	if ( m_pFindEnemyFunc == nullptr )
+		m_pFindEnemyFunc = new CFindEnemyFunc(this);
+	/////////////////////////////////
+	if ( m_pWeapons == nullptr )
+		m_pWeapons = new CBotWeapons(this);
+}
+
 // setup buttons and data structures
 void CBot :: setup ()
 {
-	/////////////////////////////////
-	m_pButtons = new CBotButtons();
-	/////////////////////////////////
-	m_pSchedules = new CBotSchedules();
-	/////////////////////////////////
-	m_pNavigator = new CWaypointNavigator(this);   
-	/////////////////////////////////
-	m_pVisibles = new CBotVisibles(this);
-	/////////////////////////////////
-	m_pFindEnemyFunc = new CFindEnemyFunc(this);
-	/////////////////////////////////
-	m_pWeapons = new CBotWeapons(this);
+	ensureSubsystems();
 
 	//stucknet = new CBotNeuralNet(3,2,2,1,0.5f);
 	//stucknet_tset = new CTrainingSet(3,1,10);
@@ -3020,6 +3083,18 @@ void CBot :: doLook ()
 
 void CBot :: doButtons ()
 {
+	// FIX: this was the crash path of the reported
+	// "CBotButtons::getBitMask() <- CBot::think() <- CBots::botThink()"
+	// stack. The button list is destroyed on level shutdown / map change
+	// (CBot::freeMapMemory) and may also be missing for a bot that was never
+	// set up; send an empty button mask instead of dereferencing null.
+	// [crashfix]
+	if ( m_pButtons == nullptr )
+	{
+		m_iButtons = 0;
+		return;
+	}
+
 	m_iButtons = m_pButtons->getBitMask();
 }
 
