@@ -60,6 +60,15 @@
 #include <tier0/vprof.h>
 #endif // RCBOT_VPROF_ENABLED
 
+// CDODBot::changeClass() logs through the shared bot logger
+// (logger->Log(LogLevel::WARN, ...)). Without this header the logger pointer
+// and the LogLevel enum are not declared in this translation unit:
+//   MSVC -> C2065 'logger' / 'WARN', C2653 'LogLevel'
+//   clang -> use of undeclared identifier 'logger'
+// Include it last: it #undef's WARN/INFO/DEBUG/TRACE, which the SDK headers
+// above may have defined as macros.
+#include "rcbot/logging.h"
+
 // Number of selectable DoD:S player classes (rifleman .. rocket). The in-game
 // player class property is 0-based, so class indices must always stay within
 // [0, DOD_NUM_CLASSES). [crashfix]
