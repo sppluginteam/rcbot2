@@ -31,6 +31,9 @@
  *
  */
 #include "bot.h"
+// Needed for logger->Log(LogLevel::WARN, ...) in changeClass(); this file did
+// not use the logger before, so the header was never included here. [buildfix]
+#include "rcbot/logging.h"
 #include "bot_cvars.h"
 #include "ndebugoverlay.h"
 #include "bot_squads.h"
@@ -60,15 +63,6 @@
 #include <tier0/vprof.h>
 #endif // RCBOT_VPROF_ENABLED
 
-// CDODBot::changeClass() logs through the shared bot logger
-// (logger->Log(LogLevel::WARN, ...)). Without this header the logger pointer
-// and the LogLevel enum are not declared in this translation unit:
-//   MSVC -> C2065 'logger' / 'WARN', C2653 'LogLevel'
-//   clang -> use of undeclared identifier 'logger'
-// Include it last: it #undef's WARN/INFO/DEBUG/TRACE, which the SDK headers
-// above may have defined as macros.
-#include "rcbot/logging.h"
-
 // Number of selectable DoD:S player classes (rifleman .. rocket). The in-game
 // player class property is 0-based, so class indices must always stay within
 // [0, DOD_NUM_CLASSES). [crashfix]
@@ -76,9 +70,70 @@ constexpr int DOD_NUM_CLASSES = 6;
 // Teams are 2 (allies) and 3 (axis) -> table rows 0 and 1. [crashfix]
 constexpr int DOD_NUM_TEAMS = 2;
 
-const char *g_DODClassCmd[DOD_NUM_TEAMS][DOD_NUM_CLASSES] = 
+const char *g_DODClassCmd[DOD_NUM_TEAMS][DOD_NUM_CLASSES] =
 { {"cls_garand","cls_tommy","cls_bar","cls_spring","cls_30cal","cls_bazooka"},
 {"cls_k98","cls_mp40","cls_mp44","cls_k98s","cls_mg42","cls_pschreck"} };
+
+// ---------------------------------------------------------------------------
+// Safe console-command dispatch for DoD:S bots. [crashfix]
+//
+// Reported crash:
+//   server.dll + 0x...                                  <- crash
+//   sourcemod.2.dods.dll!ConCommandDispatch [gamehooks.cpp:45]
+//   ...
+//   rcbot.2.dods.dll!CDODBot::selectBotWeapon(CBotWeapon*)
+//
+// helpers->ClientCommand() feeds the string straight into the server's command
+// dispatcher, so anything wrong with the *client* or with the *command text*
+// kills server.dll rather than the plugin. The edict is the dangerous one: bots
+// are removed on disconnect / team change / level shutdown, but AI code can
+// still be holding a pointer to an edict the engine has already recycled, and
+// server.dll then resolves a bogus command client and dereferences it.
+// ---------------------------------------------------------------------------
+
+// A weapon / voice / signal name is embedded into a console command, so it must
+// be a plain printable token with no whitespace (whitespace would split it into
+// extra command arguments) and no control characters.
+static bool dodIsSafeCmdToken (const char *pszToken, const std::size_t maxLen)
+{
+	if ( pszToken == nullptr || *pszToken == '\0' )
+		return false;
+
+	std::size_t len = 0;
+
+	for ( const char *p = pszToken; *p != '\0'; ++p )
+	{
+		const unsigned char c = static_cast<unsigned char>(*p);
+
+		// reject control chars, space and anything non-ASCII
+		if ( (c <= ' ') || (c > '~') )
+			return false;
+
+		if ( ++len >= maxLen )
+			return false;
+	}
+
+	return true;
+}
+
+// Returns false (and sends nothing) instead of risking a server-side crash.
+static bool dodClientCommand (edict_t *pEdict, const char *pszCommand)
+{
+	if ( pszCommand == nullptr || *pszCommand == '\0' )
+		return false;
+
+	// the Metamod game helpers interface is released on unload / shutdown
+	if ( helpers == nullptr )
+		return false;
+
+	// a freed or recycled edict is what makes server.dll die
+	if ( (pEdict == nullptr) || !CBotGlobals::entityIsValid(pEdict) )
+		return false;
+
+	helpers->ClientCommand(pEdict, pszCommand);
+
+	return true;
+}
 
 // could be a bomb 
 void CBroadcastBombEvent :: execute (CBot *pBot) 
@@ -773,7 +828,9 @@ void CDODBot :: seeFriendlyKill ( edict_t *pTeamMate, edict_t *pDied, CWeapon *p
 void CDODBot :: dropAmmo ()
 {
 	m_bDroppedAmmoThisRound = true;
-	helpers->ClientCommand(m_pEdict,"dropammo");
+	// [crashfix] same server.dll command-dispatch hazard (stale edict / helpers
+	// released on shutdown) as selectBotWeapon().
+	dodClientCommand(m_pEdict,"dropammo");
 }
 
 // use weapon ID later, use getCurrentWeapon for now
@@ -1573,20 +1630,36 @@ void CDODBot ::voiceCommand (const byte voiceCmd)
 	// find voice command
 	extern eDODVoiceCommand_t g_DODVoiceCommands[DOD_VC_INVALID];
 
+	// [crashfix] the table has DOD_VC_INVALID entries; an out-of-range index
+	// read past the end and produced a garbage command string (and pcmd itself
+	// can be null), which then went straight into server.dll's dispatcher.
+	if ( voiceCmd >= DOD_VC_INVALID )
+		return;
+
+	const char *pszCmd = g_DODVoiceCommands[voiceCmd].pcmd;
+
+	if ( !dodIsSafeCmdToken(pszCmd, 32) )
+		return;
+
 	char scmd[64];
 
-	snprintf(scmd, sizeof(scmd), "voice_%s", g_DODVoiceCommands[voiceCmd].pcmd);
+	snprintf(scmd, sizeof(scmd), "voice_%s", pszCmd);
 
-	helpers->ClientCommand(m_pEdict,scmd);
+	dodClientCommand(m_pEdict,scmd);
 }
 
 void CDODBot ::signal ( const char *signal ) const
 {
+	// [crashfix] signal was snprintf'd as "%s" with no null / sanity check,
+	// same server.dll command-dispatch hazard as selectBotWeapon().
+	if ( !dodIsSafeCmdToken(signal, 32) )
+		return;
+
 	char scmd[64];
 
 	snprintf(scmd, sizeof(scmd), "signal_%s", signal);
 
-	helpers->ClientCommand(m_pEdict,scmd);
+	dodClientCommand(m_pEdict,scmd);
 }
 
 void CDODBot :: friendlyFire ( edict_t *pEdict )
@@ -3539,31 +3612,89 @@ void CDODBot :: getTasks (unsigned iIgnore)
 
 bool CDODBot :: select_CWeapon ( CWeapon *pWeapon )
 {
+	// [crashfix] callers pass CWeapons::getWeapon(<id>) straight through, which
+	// returns null for any weapon that is not in weapons.ini, and
+	// getWeaponName() can be null as well (bot_weapons.cpp guards for exactly
+	// that). Both used to be dereferenced unconditionally here.
+	if ( pWeapon == nullptr )
+		return false;
+
+	const char *pszWeaponName = pWeapon->getWeaponName();
+
+	if ( !dodIsSafeCmdToken(pszWeaponName, 96) )
+		return false;
+
 	char cmdBuf[128];
 
-	snprintf(cmdBuf, sizeof(cmdBuf), "use %s\n", pWeapon->getWeaponName());
+	snprintf(cmdBuf, sizeof(cmdBuf), "use %s\n", pszWeaponName);
 
-	helpers->ClientCommand(m_pEdict,cmdBuf);
-
-	return true;
+	return dodClientCommand(m_pEdict, cmdBuf);
 }
 
 bool CDODBot :: selectBotWeapon ( CBotWeapon *pBotWeapon )
 {
-	if ( const CWeapon *pSelect = pBotWeapon->getWeaponInfo() )
+	// FIX: reported crash
+	//   server.dll + 0x...                                    <- crash site
+	//   sourcemod.2.dods.dll!ConCommandDispatch [gamehooks.cpp:45]
+	//   ...
+	//   rcbot.2.dods.dll!CDODBot::selectBotWeapon(CBotWeapon*)
+	//
+	// The old body was:
+	//   if ( const CWeapon *pSelect = pBotWeapon->getWeaponInfo() )
+	//       snprintf(cmdBuf, ..., "use %s\n", pSelect->getWeaponName());
+	//       helpers->ClientCommand(m_pEdict, cmdBuf);
+	//
+	// i.e. helpers->ClientCommand() was called with no validation at all. That
+	// call hands the string to the server's command dispatcher, so a bad client
+	// or a malformed command kills *server.dll*, not just the plugin:
+	//   * pBotWeapon null -> dereferenced right here
+	//   * m_pEdict stale (bot removed on disconnect / team change / level
+	//     shutdown, edict already recycled) -> server.dll resolves a bogus
+	//     command client and dereferences it. This is the one that matches a
+	//     crash inside server.dll rather than inside rcbot.
+	//   * weapon name null / empty / containing whitespace -> malformed "use"
+	//     command handed to server.dll
+	//
+	// Validate everything and bail out through failWeaponSelect() (the existing
+	// "could not switch" path) instead of dispatching anything. [crashfix]
+	if ( pBotWeapon == nullptr )
 	{
-		//int id = pSelect->getWeaponIndex();
-		char cmdBuf[128];
-
-		snprintf(cmdBuf, sizeof(cmdBuf), "use %s\n", pSelect->getWeaponName());
-
-		helpers->ClientCommand(m_pEdict,cmdBuf);
-
-		return true;
+		failWeaponSelect();
+		return false;
 	}
-	failWeaponSelect();
 
-	return false;
+	const CWeapon *pSelect = pBotWeapon->getWeaponInfo();
+
+	if ( pSelect == nullptr )
+	{
+		failWeaponSelect();
+		return false;
+	}
+
+	const char *pszWeaponName = pSelect->getWeaponName();
+
+	char cmdBuf[128];
+
+	// "use " + name + "\n" must fit (a truncated name would be a *different*,
+	// non-existent weapon), and the name must be a single command token.
+	if ( !dodIsSafeCmdToken(pszWeaponName, sizeof(cmdBuf) - 6) )
+	{
+		failWeaponSelect();
+		return false;
+	}
+
+	//int id = pSelect->getWeaponIndex();
+
+	snprintf(cmdBuf, sizeof(cmdBuf), "use %s\n", pszWeaponName);
+
+	// dodClientCommand() re-checks helpers + edict validity
+	if ( !dodClientCommand(m_pEdict, cmdBuf) )
+	{
+		failWeaponSelect();
+		return false;
+	}
+
+	return true;
 }
 
 void CDODBot :: updateConditions ()

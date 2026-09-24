@@ -802,6 +802,14 @@ void CBot::SquadInPosition ()
 
 void CBot :: kill () const
 {
+	// FIX: same class of crash as CDODBot::selectBotWeapon() - a console
+	// command is dispatched against a bot whose edict is already stale (bot
+	// removed / level shutting down). server.dll then resolves a bogus command
+	// client and dereferences it. Same for a missing helpers interface.
+	// [crashfix]
+	if ( helpers == nullptr || m_pEdict == nullptr || !CBotGlobals::entityIsValid(m_pEdict) )
+		return;
+
 	helpers->ClientCommand(m_pEdict,"kill\n");
 }
 
@@ -3584,7 +3592,14 @@ void CBots :: botThink ()
 
 			if (command && *command)
 			{
-				helpers->ClientCommand(pBot->getEdict(), command); // Use the cached value [APG]RoboCop[CL]
+				// FIX: validate the bot's edict before dispatching an arbitrary
+				// console command into server.dll - a stale edict makes the
+				// server resolve a bogus command client and crash.
+				// [crashfix]
+				edict_t *pBotEdict = pBot->getEdict();
+
+				if ( (helpers != nullptr) && (pBotEdict != nullptr) && CBotGlobals::entityIsValid(pBotEdict) )
+					helpers->ClientCommand(pBotEdict, command); // Use the cached value [APG]RoboCop[CL]
 
 				bot_command.SetValue("");
 			}
