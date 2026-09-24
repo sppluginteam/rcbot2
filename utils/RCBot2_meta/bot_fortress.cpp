@@ -8545,6 +8545,19 @@ TF_Class CBotFF::getClass()
 	return m_iClass;
 }
 
+// CBotFF declares chooseClass() (bot_fortress.h) with `override`, but no
+// definition ever existed. On Linux/clang the vtable is emitted lazily and the
+// missing symbol went unnoticed, but MSVC emits it eagerly as soon as bot.cpp
+// instantiates CBotFF (new CBotFF()), so every Windows link died with:
+//   LNK2001: unresolved external symbol CBotFF::chooseClass(void)
+//   LNK1120: 1 unresolved externals
+// CBotFF does its own class *selection* in selectClass(); choosing a desired
+// class is the same logic as the base class, so delegate. [buildfix]
+void CBotFF::chooseClass()
+{
+	CBotFortress::chooseClass();
+}
+
 void CBotFF::selectClass()
 {
 	const char* szJoinCmd = nullptr;
