@@ -197,6 +197,12 @@ void CBroadcastVoiceCommand :: execute ( CBot *pBot )
 ///////////////////////////////////////
 void CBot::runPlayerMove()
 {
+	// FIX: writing a usercmd into a freed / recycled edict is what makes the
+	// engine's PlayerRunCmd path crash; think() may have bailed for an invalid
+	// edict but this used to run regardless for every in-use bot. [crashfix]
+	if ( !CBotGlobals::entityIsValid(m_pEdict) || m_pPlayerInfo == nullptr )
+		return;
+
 	const int cmdnumbr = cmd.command_number + 1;
 
 	//////////////////////////////////
@@ -836,7 +842,12 @@ void CBot :: think ()
 	m_iMoveSpeedPriority = 0;
 	
 	// re-added
-	if ( !CBotGlobals::entityIsValid(m_pEdict) || m_pPlayerInfo == nullptr)
+	// FIX: also bail when the player info reports the client as disconnected.
+	// A bot being kicked / a fake client being torn down can still pass
+	// entityIsValid() (the edict is allocated until the disconnect lands), but
+	// every game call below would then run against a half-removed player and
+	// crash server.dll. [crashfix]
+	if ( !CBotGlobals::entityIsValid(m_pEdict) || m_pPlayerInfo == nullptr || !m_pPlayerInfo->IsConnected() )
 	{
 		// FIX: playerinfomanager / edict can be invalid here (bot kicked, map
 		// change in progress), don't dereference them blindly. [crashfix]
@@ -3563,6 +3574,17 @@ void CBots :: botThink ()
 
 		if ( pBot->inUse() )
 		{
+			// FIX: never drive a bot whose edict is invalid / already recycled
+			// this frame. CBot::think() guards internally, but runPlayerMove()
+			// and the bot_command dispatch below used to run unconditionally for
+			// every in-use bot - writing usercmds and dispatching commands into
+			// a freed or recycled edict is the server.dll crash (0x2a2ad4
+			// signature) reported through Accelerator. [crashfix]
+			edict_t *pBotEdict = pBot->getEdict();
+
+			if ( (pBotEdict == nullptr) || !CBotGlobals::entityIsValid(pBotEdict) )
+				continue;
+
 			if ( !bBotStop )
 			{
 				#ifdef _DEBUG
@@ -3595,9 +3617,7 @@ void CBots :: botThink ()
 				// FIX: validate the bot's edict before dispatching an arbitrary
 				// console command into server.dll - a stale edict makes the
 				// server resolve a bogus command client and crash.
-				// [crashfix]
-				edict_t *pBotEdict = pBot->getEdict();
-
+				// [crashfix] (pBotEdict was already validated above this frame)
 				if ( (helpers != nullptr) && (pBotEdict != nullptr) && CBotGlobals::entityIsValid(pBotEdict) )
 					helpers->ClientCommand(pBotEdict, command); // Use the cached value [APG]RoboCop[CL]
 

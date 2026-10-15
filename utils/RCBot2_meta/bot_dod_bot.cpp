@@ -117,7 +117,16 @@ static bool dodIsSafeCmdToken (const char *pszToken, const std::size_t maxLen)
 }
 
 // Returns false (and sends nothing) instead of risking a server-side crash.
-static bool dodClientCommand (edict_t *pEdict, const char *pszCommand)
+//
+// bRequireAlive additionally refuses to dispatch while the fake client is dead,
+// not yet spawned, or mid-disconnect. An edict can still pass entityIsValid()
+// while the underlying player is in one of those states (DOD:S keeps the edict
+// allocated until the disconnect actually lands), and the game's command
+// handlers ("use", class changes, dropammo) dereference the player's weapon /
+// class / death state - a bot that dies between the isAlive() check in
+// CBot::think() and the dispatch in the same frame is exactly the
+// server.dll+0x2a2ad4 crash seen in the Accelerator reports. [crashfix]
+static bool dodClientCommand (edict_t *pEdict, const char *pszCommand, const bool bRequireAlive)
 {
 	if ( pszCommand == nullptr || *pszCommand == '\0' )
 		return false;
@@ -130,9 +139,33 @@ static bool dodClientCommand (edict_t *pEdict, const char *pszCommand)
 	if ( (pEdict == nullptr) || !CBotGlobals::entityIsValid(pEdict) )
 		return false;
 
+	if ( bRequireAlive )
+	{
+		// playerinfomanager can be released during shutdown before helpers
+		if ( playerinfomanager == nullptr )
+			return false;
+
+		IPlayerInfo *pInfo = playerinfomanager->GetPlayerInfo(pEdict);
+
+		// fake client mid-disconnect / never fully connected: the edict is
+		// still "valid" but the player is already gone from the game's view
+		if ( pInfo == nullptr || !pInfo->IsConnected() )
+			return false;
+
+		// dead or not yet spawned - gameplay commands must never go out here
+		if ( pInfo->IsDead() )
+			return false;
+	}
+
 	helpers->ClientCommand(pEdict, pszCommand);
 
 	return true;
+}
+
+// convenience: gameplay commands require an alive, connected player by default
+static bool dodClientCommand (edict_t *pEdict, const char *pszCommand)
+{
+	return dodClientCommand(pEdict, pszCommand, true);
 }
 
 // could be a bomb 
@@ -1208,7 +1241,10 @@ void CDODBot :: changeClass ()
 
 	// change class
 	//selectClass();
-	helpers->ClientCommand(m_pEdict,g_DODClassCmd[iTeam - TEAM_ALLIES][m_iDesiredClass]);
+	// [crashfix] dispatch through the validated wrapper: it re-checks the
+	// edict/helpers and refuses to send while the bot is dead or mid-disconnect
+	// (the direct helpers->ClientCommand() call below used to bypass all of it).
+	dodClientCommand(m_pEdict, g_DODClassCmd[iTeam - TEAM_ALLIES][m_iDesiredClass], true);
 
 	m_fChangeClassTime = engine->Time() + randomFloat(bot_min_cc_time.GetFloat(),bot_max_cc_time.GetFloat());
 }
@@ -1315,6 +1351,15 @@ void CDODBot :: modThink ()
 #ifdef RCBOT_VPROF_ENABLED
 	VPROF_BUDGET("CDODBot::modThink", "RCBot2")
 #endif // RCBOT_VPROF_ENABLED
+
+	// FIX: the bot can die *during* the same frame that CBot::think() ran its
+	// isAlive() check (server damage/death is processed in the same tick). The
+	// weapon / prone / deploy code below dereferences player and weapon state
+	// that server.dll has already torn down - the crash site in the
+	// OnTakeDamage and vphysics Accelerator reports. Skip the frame; the next
+	// think() routes the bot through currentlyDead() instead. [crashfix]
+	if ( m_pPlayerInfo == nullptr || m_pPlayerInfo->IsDead() )
+		return;
 
 	static float fMaxSpeed;
 	static CBotWeapon *pWeapon;
@@ -1645,7 +1690,9 @@ void CDODBot ::voiceCommand (const byte voiceCmd)
 
 	snprintf(scmd, sizeof(scmd), "voice_%s", pszCmd);
 
-	dodClientCommand(m_pEdict,scmd);
+	// voice menu commands are safe while dead (and are often fired on a kill),
+	// so keep the edict/helpers validation but skip the alive requirement.
+	dodClientCommand(m_pEdict, scmd, false);
 }
 
 void CDODBot ::signal ( const char *signal ) const
@@ -1659,7 +1706,9 @@ void CDODBot ::signal ( const char *signal ) const
 
 	snprintf(scmd, sizeof(scmd), "signal_%s", signal);
 
-	dodClientCommand(m_pEdict,scmd);
+	// voice/signal-style commands stay usable while dead - keep the edict and
+	// helpers validation only.
+	dodClientCommand(m_pEdict, scmd, false);
 }
 
 void CDODBot :: friendlyFire ( edict_t *pEdict )
@@ -3628,7 +3677,9 @@ bool CDODBot :: select_CWeapon ( CWeapon *pWeapon )
 
 	snprintf(cmdBuf, sizeof(cmdBuf), "use %s\n", pszWeaponName);
 
-	return dodClientCommand(m_pEdict, cmdBuf);
+	// requires an alive, connected bot: "use" on a dead player is one of the
+	// server.dll+0x2a2ad4 crash paths in the Accelerator reports
+	return dodClientCommand(m_pEdict, cmdBuf, true);
 }
 
 bool CDODBot :: selectBotWeapon ( CBotWeapon *pBotWeapon )
@@ -3687,8 +3738,10 @@ bool CDODBot :: selectBotWeapon ( CBotWeapon *pBotWeapon )
 
 	snprintf(cmdBuf, sizeof(cmdBuf), "use %s\n", pszWeaponName);
 
-	// dodClientCommand() re-checks helpers + edict validity
-	if ( !dodClientCommand(m_pEdict, cmdBuf) )
+	// dodClientCommand() re-checks helpers + edict validity and refuses while
+	// the bot is dead / mid-disconnect ("use" on a dead player crashes
+	// server.dll at the reported 0x2a2ad4 site)
+	if ( !dodClientCommand(m_pEdict, cmdBuf, true) )
 	{
 		failWeaponSelect();
 		return false;
