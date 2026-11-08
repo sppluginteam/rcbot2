@@ -287,6 +287,17 @@ class MMSConfig(object):
 
     SdkHelpers.configureCxx(context, binary, sdk)
 
+    # Newer hl2sdk-manifests revisions add warning suppression flags that only
+    # exist in recent clang releases (e.g. -Wno-nontrivial-memcall and
+    # -Wno-sync-alignment, clang >= 15).  Older clang (e.g. Debian bookworm's
+    # clang 14 used by CI) reports them as "unknown warning option", and since
+    # the build uses -Werror that becomes a hard error.  Downgrade unknown
+    # warning options to plain warnings so old clang can still build.
+    # Only applied to clang - MSVC/GCC do not understand this flag. [APG]RoboCop[CL]
+    if cxx.family == 'clang':
+      cxx.cflags += ['-Wno-unknown-warning-option']
+      cxx.cxxflags += ['-Wno-unknown-warning-option']
+
     return binary
 
 if builder.options.breakpadupload == '1' and not 'BREAKPAD_SYMBOL_SERVER' in os.environ:
