@@ -2,6 +2,13 @@
 build/
 build_linux/
 premake_build/
+build_x86/
+build_x64/
+dist/
+post/
+
+# Local dependency checkouts (build.bat / build_linux.sh)
+deps/
 
 utils/RCBot2_meta/Debug
 utils/RCBot2_meta/.vs
