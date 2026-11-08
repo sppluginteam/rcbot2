@@ -610,6 +610,13 @@ bool CWaypointNavigator::getCoverPosition(const Vector& vCoverOrigin, Vector* vC
 
 void CWaypointNavigator :: beliefOne (const int iWptIndex, const BotBelief iBeliefType, const float fDist)
 {
+	// [crashfix] m_fBelief is a fixed MAX_WAYPOINTS array. Callers such as
+	// CDODBot::bombEvent() feed this index straight from game events through
+	// CDODFlags::getWaypointAtFlag() - a -1 or stale index wrote out of
+	// bounds and corrupted the heap.
+	if ( iWptIndex < 0 || iWptIndex >= CWaypoints::MAX_WAYPOINTS )
+		return;
+
 	if ( iBeliefType == BELIEF_SAFETY )
 	{
 		if ( m_fBelief[iWptIndex] > 0)

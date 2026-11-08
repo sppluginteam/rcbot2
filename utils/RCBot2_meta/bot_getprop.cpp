@@ -680,6 +680,17 @@ void CClassInterfaceValue :: getData ( void *edict, const bool bIsEdict )
 
 		pEntity = pUnknown->GetBaseEntity();
 
+		// [crashfix] a null CBaseEntity would still produce a non-null m_data
+		// below (offset arithmetic on nullptr gives m_offset itself), so
+		// getInt() dereferenced a low address instead of returning the
+		// default value - C++ try/catch does not catch the access violation.
+		if (!pEntity)
+		{
+			m_data = nullptr;
+			m_berror = true;
+			return;
+		}
+
 		m_data = static_cast<void*>(reinterpret_cast<char*>(pEntity) + static_cast<std::size_t>(m_offset));
 
 	}

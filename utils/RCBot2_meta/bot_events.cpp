@@ -1034,21 +1034,33 @@ void CDODPointCaptured :: execute ( IBotEventInterface *pEvent )
 	const int cp = pEvent->getInt("cp");
 	const char *szCappers = pEvent->getString("cappers", nullptr);
 
-	// get a capper
-	const char userid = szCappers[0];
+	// [crashfix] getString() returns nullptr when the key is missing, and the
+	// code below did szCappers[0] unguarded - a null dereference in the event
+	// handler killed the server. A capper that disconnects mid-event also
+	// leaves CClients::get() returning nullptr (the assert above it is
+	// compiled out in release).
+	if ( szCappers == nullptr || szCappers[0] == '\0' )
+		return;
+
+	// get a capper - this byte is an entity index, not a signed char/userid
+	const int userid = static_cast<unsigned char>(szCappers[0]);
 
 	int team = 0;
 
 	// find the team - should be a player index
-	if ( userid >= 0 && userid <= gpGlobals->maxClients )
+	if ( userid >= 1 && userid <= gpGlobals->maxClients )
 	{
 		edict_t* pPlayer = INDEXENT(userid);
+
+		if ( pPlayer == nullptr )
+			return;
+
 		team = CClassInterface::getTeam(pPlayer);
 
 		CClient *pClient = CClients::get(pPlayer);
 
-		assert(pClient != nullptr);
-		if (pClient->autoWaypointOn())
+		// [crashfix] release builds compile the assert away -> null deref
+		if ( pClient != nullptr && pClient->autoWaypointOn() )
 		{
 			pClient->autoEventWaypoint(CWaypointTypes::W_FL_CAPPOINT, 150.0f, false, 0, Vector(0, 0, 0), true);
 		}

@@ -168,6 +168,147 @@ static bool dodClientCommand (edict_t *pEdict, const char *pszCommand)
 	return dodClientCommand(pEdict, pszCommand, true);
 }
 
+// ---------------------------------------------------------------------------
+// DoD:S weapon commands - guard against server.dll+0x2a2ad4. [crashfix]
+//
+// The Accelerator crash 5BVD-OOHJ-P5PQ (30 reports, all with the same
+// signature) has this stack:
+//
+//   server.dll + 0x2a2ad4                                  <- crash
+//   server.dll + 0xe16dc
+//   server.dll + 0x11115b
+//   server.dll + 0x1101d2
+//   server.dll + 0x12971f
+//   server.dll + 0x2cc766
+//   sourcemod.2.dods.dll!__SourceHook_FHCls_ConCommandDispatch...
+//   engine.dll + 0x1502de ...
+//   rcbot.2.dods.dll + 0x38658                            <- helpers->ClientCommand
+//
+// The RCBot2 frame is CDODBot::selectBotWeapon(), which sends "use <weapon>".
+// Tracing server.dll shows what "use" does:
+//
+//   0x101296e0  ConCommand callback for "use"
+//                 -> player = command source
+//                 -> if (!player || !player->vfunc[0x148]()) return;   (IsAlive)
+//                 -> player->vfunc[0x654](name, 0)
+//   0x10110150    CBasePlayer::UseWeapon(name)
+//                 -> weapon = FindWeaponInInventoryByName(name)  (0x100e1470,
+//                    walks the 48 handles of m_hMyWeapons, player+0x75c)
+//                 -> player->vfunc[0x438](weapon, 0)
+//   0x10111140    CBasePlayer::EquipWeapon(weapon, ...)
+//                 -> 0x100e15a0
+//   0x100e15a0    if (weapon != m_hActiveWeapon) {
+//                     if (!player->vfunc[0x440](weapon)) return false;
+//                     pActive = resolve(m_hActiveWeapon);
+//                     if (pActive) {
+//                         pActive->vfunc[0x3fc](weapon);   <-- 0x100e16da
+//                         ...
+//   0x102a2ab0    the weapon virtual at slot 0x3fc:
+//                     CBasePlayer *pOwner = GetOwnerPlayer();  // m_hOwnerEntity
+//                     if ( !pOwner || !pOwner->vfunc[0x148]() )
+//                         pOwner = NULL;              // <- Valve's source
+//                     pOwner->m_flWeaponIdleTime = 0; // <- writes through NULL
+//
+// The last one is a plain Valve bug (an MSVC optimizer turned the
+// "pOwner = NULL" branch into a jump that keeps the pointer it had already
+// proven to be non-NULL), but the bot is what triggers it: the weapon that is
+// equipped has no owner (or a dead one) while the bot itself is still alive -
+// exactly the state a bot can be in right after a class change, a respawn or
+// a weapon drop.
+//
+// So before any command that makes the game touch the equipped weapon we
+// check the very same pre-condition the game checks: the equipped weapon has
+// to exist, it has to be owned by the bot itself and that owner has to be
+// alive. If it is not, we simply do not send the command - the bot keeps its
+// weapon for one more frame instead of killing the server.
+// ---------------------------------------------------------------------------
+
+// Is the weapon the bot currently has equipped in a state the game can safely
+// work with? (i.e. it exists and it is owned by the living bot itself)
+static bool dodWeaponStateIsSafe (edict_t *pEdict)
+{
+	if ( pEdict == nullptr || !CBotGlobals::entityIsValid(pEdict) )
+		return false;
+
+	// the weapon the game will run the crashing virtual on (m_hActiveWeapon)
+	edict_t *pWeapon = CClassInterface::getCurrentWeapon(pEdict);
+
+	if ( pWeapon == nullptr )
+	{
+		// nothing equipped: the game never reaches the crashing call
+		// (EquipWeapon() only calls it when there is an active weapon)
+		return true;
+	}
+
+	if ( !CBotGlobals::entityIsValid(pWeapon) )
+		return false;
+
+	// the owner of that weapon (m_hOwnerEntity) - this is the pointer the
+	// game writes through without checking it for NULL
+	edict_t *pOwner = CClassInterface::getOwner(pWeapon);
+
+	// ownerless weapon -> server.dll writes through NULL + 0x1428
+	if ( pOwner == nullptr )
+		return false;
+
+	// the equipped weapon belongs to somebody else (stale handle, recycled
+	// edict, weapon of a player that died): the game checks *that* player's
+	// life state, so we cannot vouch for the weapon
+	if ( pOwner != pEdict )
+		return false;
+
+	// dead owner -> the game nulls the pointer and writes through NULL
+	if ( !CBotGlobals::entityIsAlive(pOwner) )
+		return false;
+
+	return true;
+}
+
+// Rate limited diagnostic, so a bot that is stuck in the bad state cannot
+// flood the server log.
+static void dodLogWeaponStateBlocked ( edict_t *pEdict, const char *pszCommand )
+{
+	static float fLastLogTime = 0.0f;
+	static int iBlockedCount = 0;
+
+	++iBlockedCount;
+
+	const float fNow = (engine != nullptr) ? engine->Time() : 0.0f;
+
+	if ( (fNow - fLastLogTime) < 5.0f )
+		return;
+
+	fLastLogTime = fNow;
+
+	if ( logger != nullptr )
+	{
+		logger->Log(LogLevel::WARN, "[crashfix] blocked '%s' for entity %d - equipped weapon has no valid owner (%d blocked)", pszCommand, (pEdict != nullptr) ? ENTINDEX(pEdict) : 0, iBlockedCount);
+	}
+
+	iBlockedCount = 0;
+}
+
+// Send a "use <weapon>" command - the DoD:S weapon switch.
+static bool dodIssueUseCommand ( edict_t *pEdict, const char *pszWeaponName )
+{
+	if ( !dodIsSafeCmdToken(pszWeaponName, 96) )
+		return false;
+
+	char cmdBuf[128];
+
+	snprintf(cmdBuf, sizeof(cmdBuf), "use %s\n", pszWeaponName);
+
+	if ( !dodWeaponStateIsSafe(pEdict) )
+	{
+		dodLogWeaponStateBlocked(pEdict, "use");
+		return false;
+	}
+
+	// dodClientCommand() re-checks helpers + edict validity and refuses while
+	// the bot is dead / mid-disconnect
+	return dodClientCommand(pEdict, cmdBuf, true);
+}
+
 // could be a bomb 
 void CBroadcastBombEvent :: execute (CBot *pBot) 
 {
@@ -331,6 +472,11 @@ bool CDODBot :: setVisible ( edict_t *pEntity, const bool bVisible )
 
 	szClassname = pEntity->GetClassName();
 
+	// [crashfix] a freed / not-yet-shared edict can have no classname; every
+	// strncmp() below would dereference nullptr
+	if ( szClassname == nullptr )
+		return bValid;
+
 	bNoDraw = ((CClassInterface::getEffects(pEntity) & EF_NODRAW) == EF_NODRAW);
 
 	if ( bVisible && !bNoDraw && bValid )
@@ -354,7 +500,10 @@ bool CDODBot :: setVisible ( edict_t *pEntity, const bool bVisible )
 		// grenade_smoke
 		// 012345678
 		// don't run away from smoke grenades
-		else if ( (pEntity!=m_pEnemyGrenade) && (szClassname[8]!='s') && (std::strncmp(szClassname,"grenade",7) == 0 ) && 
+		// [crashfix] the old "szClassname[8] != 's'" test read index 8 before
+		// checking the length - short classnames read past the terminator
+		else if ( (pEntity!=m_pEnemyGrenade) && (std::strncmp(szClassname,"grenade",7) == 0 ) &&
+			(std::strncmp(szClassname,"grenade_smoke",13) != 0) && 
 			((CClassInterface::getGrenadeThrower(pEntity) == m_pEdict) || 
 			 ((CClassInterface::getTeam(pEntity) == m_iEnemyTeam)||bFriendlyFire)))
 		{
@@ -862,7 +1011,15 @@ void CDODBot :: dropAmmo ()
 {
 	m_bDroppedAmmoThisRound = true;
 	// [crashfix] same server.dll command-dispatch hazard (stale edict / helpers
-	// released on shutdown) as selectBotWeapon().
+	// released on shutdown) as selectBotWeapon(). "dropammo" also makes the
+	// game work on the weapon the bot currently has equipped, so it needs the
+	// same "the equipped weapon still belongs to this living bot" check.
+	if ( !dodWeaponStateIsSafe(m_pEdict) )
+	{
+		dodLogWeaponStateBlocked(m_pEdict, "dropammo");
+		return;
+	}
+
 	dodClientCommand(m_pEdict,"dropammo");
 }
 
@@ -3670,16 +3827,11 @@ bool CDODBot :: select_CWeapon ( CWeapon *pWeapon )
 
 	const char *pszWeaponName = pWeapon->getWeaponName();
 
-	if ( !dodIsSafeCmdToken(pszWeaponName, 96) )
-		return false;
-
-	char cmdBuf[128];
-
-	snprintf(cmdBuf, sizeof(cmdBuf), "use %s\n", pszWeaponName);
-
-	// requires an alive, connected bot: "use" on a dead player is one of the
-	// server.dll+0x2a2ad4 crash paths in the Accelerator reports
-	return dodClientCommand(m_pEdict, cmdBuf, true);
+	// [crashfix] dodIssueUseCommand() validates the weapon name, verifies
+	// that the equipped weapon still belongs to the living bot (otherwise
+	// server.dll writes through a NULL owner pointer at 0x2a2ad4) and only
+	// then dispatches the command.
+	return dodIssueUseCommand(m_pEdict, pszWeaponName);
 }
 
 bool CDODBot :: selectBotWeapon ( CBotWeapon *pBotWeapon )
@@ -3724,11 +3876,9 @@ bool CDODBot :: selectBotWeapon ( CBotWeapon *pBotWeapon )
 
 	const char *pszWeaponName = pSelect->getWeaponName();
 
-	char cmdBuf[128];
-
 	// "use " + name + "\n" must fit (a truncated name would be a *different*,
 	// non-existent weapon), and the name must be a single command token.
-	if ( !dodIsSafeCmdToken(pszWeaponName, sizeof(cmdBuf) - 6) )
+	if ( !dodIsSafeCmdToken(pszWeaponName, 96) )
 	{
 		failWeaponSelect();
 		return false;
@@ -3736,12 +3886,12 @@ bool CDODBot :: selectBotWeapon ( CBotWeapon *pBotWeapon )
 
 	//int id = pSelect->getWeaponIndex();
 
-	snprintf(cmdBuf, sizeof(cmdBuf), "use %s\n", pszWeaponName);
-
-	// dodClientCommand() re-checks helpers + edict validity and refuses while
-	// the bot is dead / mid-disconnect ("use" on a dead player crashes
-	// server.dll at the reported 0x2a2ad4 site)
-	if ( !dodClientCommand(m_pEdict, cmdBuf, true) )
+	// [crashfix] dodIssueUseCommand() does the rest of the validation:
+	//   * the equipped weapon has to be owned by the living bot - the game
+	//     writes through that owner pointer without a NULL check and kills
+	//     the whole server (server.dll+0x2a2ad4) when it is missing
+	//   * the command is only dispatched to a connected, alive fake client
+	if ( !dodIssueUseCommand(m_pEdict, pszWeaponName) )
 	{
 		failWeaponSelect();
 		return false;

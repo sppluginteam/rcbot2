@@ -234,6 +234,11 @@ int CDODMod::getHighestScore ()
 
 bool CDODFlags::isTeamMateDefusing (const edict_t *pIgnore, const int iTeam, const int id) const
 {
+	// [crashfix] callers (CBotDODBomb) pass m_iBombID which is -1 for
+	// path bombs - m_pBombs[-1] read out of bounds
+	if ( id < 0 || id >= MAX_DOD_FLAGS )
+		return false;
+
 	if ( m_pBombs[id][0] != nullptr)
 		return isTeamMateDefusing(pIgnore,iTeam,CBotGlobals::entityOrigin(m_pBombs[id][0]));
 
@@ -253,6 +258,12 @@ bool CDODFlags::isTeamMateDefusing (const edict_t *pIgnore, const int iTeam, con
 			continue;
 
 		IPlayerInfo* pPlayerinfo = playerinfomanager->GetPlayerInfo(pPlayer);
+
+		// [crashfix] entityIsValid() does not guarantee a player info yet
+		// (disconnecting player) - the old code dereferenced it unconditionally
+		if ( pPlayerinfo == nullptr )
+			continue;
+
 		const CBotCmd cmd = pPlayerinfo->GetLastUserCommand();
 
 		if ( CClassInterface::isPlayerDefusingBomb_DOD(pPlayer) || cmd.buttons & IN_USE )
@@ -299,6 +310,10 @@ bool CDODFlags::isTeamMatePlanting (const edict_t *pIgnore, const int iTeam, con
 
 bool CDODFlags::isTeamMatePlanting (const edict_t *pIgnore, const int iTeam, const int id) const
 {
+	// [crashfix] see isTeamMateDefusing() - id can be -1
+	if ( id < 0 || id >= MAX_DOD_FLAGS )
+		return false;
+
 	if ( m_pBombs[id][0] )
 		return isTeamMatePlanting(pIgnore,iTeam,CBotGlobals::entityOrigin(m_pBombs[id][0]));
 
@@ -636,6 +651,30 @@ int CDODFlags::setup(edict_t *pResourceEntity)
 		// get the Capture point positions
 		m_vCPPositions = CClassInterface::getDODCP_Positions(pResourceEntity);
 
+		// [crashfix] the loops below index the fixed MAX_DOD_FLAGS arrays with
+		// m_iNumControlPoints straight from the objective resource - and the
+		// comment near the end of this function even notes the value can be
+		// "larger than it should be". The old clamp only ran *after* those
+		// loops had already written m_pFlags[j] / m_pBombs[j] / m_iWaypoint[j]
+		// out of bounds. Clamp (and validate the resolved prop pointers) first.
+		if ( m_iNumControlPoints < 0 || m_iNumControlPoints > MAX_DOD_FLAGS )
+		{
+			CBotGlobals::botMessage(nullptr, 1, "[crashfix] CDODFlags::setup: bad control point count %d, clamped", m_iNumControlPoints);
+			m_iNumControlPoints = std::max(0, std::min(m_iNumControlPoints, static_cast<int>(MAX_DOD_FLAGS)));
+		}
+
+		// [crashfix] if any SendProp failed to resolve, getIntPointer() hands
+		// back nullptr and every m_iOwner[i] style read below dereferences it
+		if ( m_iNumAxis == nullptr || m_iNumAllies == nullptr || m_iOwner == nullptr ||
+			 m_iAlliesReqCappers == nullptr || m_iAxisReqCappers == nullptr ||
+			 m_bBombPlanted_Unreliable == nullptr || m_iBombsRequired == nullptr ||
+			 m_iBombsRemaining == nullptr || m_bBombBeingDefused == nullptr ||
+			 m_vCPPositions == nullptr )
+		{
+			CBotGlobals::botMessage(nullptr, 1, "[crashfix] CDODFlags::setup: objective resource props not resolved, no control points");
+			m_iNumControlPoints = 0;
+			return DOD_MAPTYPE_UNKNOWN;
+		}
 	}
 
 	//	string_t model;		

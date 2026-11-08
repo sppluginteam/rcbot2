@@ -283,6 +283,13 @@ public:
 
 	int getWaypointAtFlag (const int iFlagId) const
 	{
+		// [crashfix] callers pass the game event "cp" field straight in
+		// (CDODBot::bombEvent) - an out-of-range index read past m_iWaypoint[]
+		// and the garbage waypoint id was then used by beliefOne() as an
+		// m_fBelief[] index (out-of-bounds write).
+		if ( iFlagId < 0 || iFlagId >= MAX_DOD_FLAGS || iFlagId >= m_iNumControlPoints )
+			return -1;
+
 		return m_iWaypoint[iFlagId];
 	}
 
@@ -327,11 +334,21 @@ public:
 
 	bool isBombExplodeImminent(const int id) const
 	{
+		// [crashfix] id can be -1 (getBombID() miss) or an event "cp" value
+		if ( id < 0 || id >= MAX_DOD_FLAGS )
+			return false;
+
 		return engine->Time() - m_fBombPlantedTime[id] > DOD_BOMB_EXPLODE_IMMINENT_TIME;
 	}
 
 	void setBombPlanted (const int id, const bool val)
 	{
+		// [crashfix] called from the dod_bomb_* game event handlers with the
+		// raw "cp" field; -1 / >= MAX_DOD_FLAGS wrote past m_bBombPlanted[]
+		// and m_fBombPlantedTime[] (heap corruption).
+		if ( id < 0 || id >= MAX_DOD_FLAGS )
+			return;
+
 		m_bBombPlanted[id] = val;
 
 		if ( val )
@@ -357,7 +374,8 @@ public:
 
 	bool ownsFlag (const int iFlag, const int iTeam) const
 	{
-		if ( iFlag == -1 )
+		// [crashfix] also bound the upper end - only -1 used to be checked
+		if ( iFlag < 0 || iFlag >= MAX_DOD_FLAGS || iFlag >= m_iNumControlPoints )
 			return false;
 
 		return m_iOwner[iFlag] == iTeam;
@@ -380,7 +398,8 @@ public:
 
 	int numCappersRequired (const int iFlag, const int iTeam) const
 	{
-		if ( iFlag == -1 )
+		// [crashfix] upper bound as well as the -1 check
+		if ( iFlag < 0 || iFlag >= MAX_DOD_FLAGS || iFlag >= m_iNumControlPoints )
 			return 0;
 
 		return iTeam == TEAM_ALLIES ? m_iAlliesReqCappers[iFlag] : m_iAxisReqCappers[iFlag];
@@ -388,7 +407,8 @@ public:
 
 	bool isBombPlanted (const int iId) const
 	{
-		if ( iId == -1 )
+		// [crashfix] bound the upper end too (event "cp" / getBombID() miss)
+		if ( iId < 0 || iId >= MAX_DOD_FLAGS )
 			return false;
 
 		return m_bBombPlanted[iId];
@@ -401,16 +421,28 @@ public:
 
 	bool canDefendBomb (const int iTeam, const int iId) const
 	{
+		// [crashfix] iId comes from getBombID() which returns -1 on a miss
+		if ( iId < 0 || iId >= MAX_DOD_FLAGS )
+			return false;
+
 		return m_pBombs[iId][0]!= nullptr &&m_iOwner[iId]!=iTeam && isBombPlanted(iId);
 	}
 
 	bool canDefuseBomb (const int iTeam, const int iId) const
 	{
+		// [crashfix] see canDefendBomb()
+		if ( iId < 0 || iId >= MAX_DOD_FLAGS )
+			return false;
+
 		return m_pBombs[iId][0]!= nullptr &&m_iOwner[iId]==iTeam && isBombPlanted(iId);
 	}
 
 	bool canPlantBomb (const int iTeam, const int iId) const
 	{
+		// [crashfix] see canDefendBomb()
+		if ( iId < 0 || iId >= MAX_DOD_FLAGS )
+			return false;
+
 		return m_pBombs[iId][0]!= nullptr &&m_iOwner[iId]!=iTeam && !isBombPlanted(iId);
 	}
 
@@ -422,7 +454,8 @@ public:
 
 	int getNumBombsRequired (const int iId) const
 	{
-		if ( iId == -1 )
+		// [crashfix] bound the upper end too (event "cp" / getBombID() miss)
+		if ( iId < 0 || iId >= MAX_DOD_FLAGS )
 			return 0;
 
 		return m_iBombsRequired[iId];
@@ -435,7 +468,8 @@ public:
 
 	int getNumBombsRemaining (const int iId) const
 	{
-		if ( iId == -1 )
+		// [crashfix] see getNumBombsRequired()
+		if ( iId < 0 || iId >= MAX_DOD_FLAGS )
 			return 0;
 
 		return m_iBombsRemaining[iId];
@@ -448,7 +482,8 @@ public:
 
 	bool isBombBeingDefused (const int iId) const
 	{
-		if ( iId == -1 )
+		// [crashfix] see getNumBombsRequired()
+		if ( iId < 0 || iId >= MAX_DOD_FLAGS )
 			return false;
 
 		return m_bBombBeingDefused[iId];

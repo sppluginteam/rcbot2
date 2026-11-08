@@ -712,7 +712,13 @@ edict_t *CBotGlobals :: playerByUserId(const int iUserId)
 
 int CBotGlobals :: getTeam ( edict_t *pEntity )
 {
-	IPlayerInfo *p = playerinfomanager->GetPlayerInfo(pEntity);
+	IPlayerInfo *p = pEntity ? playerinfomanager->GetPlayerInfo(pEntity) : nullptr;
+
+	// [crashfix] a freed/disconnected player edict yields no IPlayerInfo and
+	// the old code dereferenced it unconditionally (bot_dod_bot.cpp:991 etc.)
+	if ( !p )
+		return 0;
+
 	return p->GetTeamIndex();
 }
 
