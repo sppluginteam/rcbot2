@@ -171,7 +171,10 @@ typedef enum : std::int16_t
 	GETPROP_CSS_HOSTAGE_RESCUED = 153,
 	GETPROP_CSS_HOSTAGE_LEADER = 154,
 	GETPROP_TF2_CURRENCY = 155,
-	GET_PROPDATA_MAX = 156
+	// DOD:S crash guard: CBaseCombatWeapon::m_hOwner (NOT m_hOwnerEntity -
+	// the rocket crash at server.dll+0x2a2ad4 reads this field, weapon+0x49c)
+	GETPROP_DOD_WEAPON_OWNER = 156,
+	GET_PROPDATA_MAX = 157
 } getpropdata_id;
 
 bool UTIL_FindSendPropInfo(const ServerClass *pInfo, const char *szType, unsigned *offset);
@@ -480,6 +483,29 @@ public:
 	//static void setTickBase ( edict_t *edict, int tickbase ) { return ;
 	static int isTeleporterMode (edict_t *edict, const eTeleMode mode ) { return g_GetProps[GETPROP_TF2TELEPORTERMODE].getInt(edict,-1) == static_cast<int>(mode); }
 	static edict_t *getCurrentWeapon (edict_t *player) { return g_GetProps[GETPROP_CURRENTWEAPON].getEntity(player); }
+	// DOD:S crash guard helpers (see RCBotPluginMeta::Hook_DodWeaponGuard).
+	//
+	// raw handle of CBaseCombatWeapon::m_hOwner (weapon+0x49c). getOwner()
+	// above reads m_hOwnerEntity instead, which is NOT the field the
+	// server.dll+0x2a2ad4 rocket crash dereferences.
+	static CBaseHandle *getWeaponOwnerHandle ( edict_t *pWeapon ) { return g_GetProps[GETPROP_DOD_WEAPON_OWNER].getEntityHandle(pWeapon); }
+	// raw handle of CBaseCombatCharacter::m_hActiveWeapon (player+0x81c)
+	static CBaseHandle *getActiveWeaponHandle ( edict_t *pPlayer ) { return g_GetProps[GETPROP_CURRENTWEAPON].getEntityHandle(pPlayer); }
+	// 0 means the netprop was not found - callers must treat that as "guard
+	// unavailable" rather than "owner is missing"
+	static unsigned getWeaponOwnerOffset () { return static_cast<unsigned>(g_GetProps[GETPROP_DOD_WEAPON_OWNER].getOffset()); }
+	static unsigned getActiveWeaponOffset () { return static_cast<unsigned>(g_GetProps[GETPROP_CURRENTWEAPON].getOffset()); }
+	// invalidate CBaseCombatCharacter::m_hActiveWeapon so a subsequent weapon
+	// vfunc dispatch resolves to null and takes its own null-owner branch
+	// instead of writing through a null owner pointer
+	static bool clearActiveWeapon ( edict_t *pPlayer )
+	{
+		CBaseHandle *pHandle = g_GetProps[GETPROP_CURRENTWEAPON].getEntityHandle(pPlayer);
+		if ( pHandle == nullptr )
+			return false;
+		pHandle->Term();
+		return true;
+	}
 	static int getUberChargeLevel (edict_t *pWeapon) { return static_cast<int>(g_GetProps[GETPROP_TF2UBERCHARGE_LEVEL].getFloat(pWeapon, 0) * 100.0f); }
 	//static void test ();
 	static float getSentryHealth ( edict_t *edict ) { return g_GetProps[GETPROP_TF2SENTRYHEALTH].getFloatFromInt(edict,100); }

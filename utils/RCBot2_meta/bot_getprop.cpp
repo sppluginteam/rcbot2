@@ -439,6 +439,8 @@ void CClassInterface:: init ()
 		DEFINE_GETPROP(GETPROP_TF2MEDIGUN_TARGETTING,"CWeaponMedigun","m_hHealingTarget",0);
 		DEFINE_GETPROP(GETPROP_TF2TELEPORTERMODE,"CObjectTeleporter","m_iObjectMode",0);
 		DEFINE_GETPROP(GETPROP_CURRENTWEAPON,"CBaseCombatCharacter","m_hActiveWeapon",0);
+		// DOD:S crash guard: the crash field (weapon+0x49c) - see GETPROP_DOD_WEAPON_OWNER
+		DEFINE_GETPROP(GETPROP_DOD_WEAPON_OWNER,"CBaseCombatWeapon","m_hOwner",0);
 		DEFINE_GETPROP(GETPROP_TF2UBERCHARGE_LEVEL,"CWeaponMedigun","m_flChargeLevel",0);
 		DEFINE_GETPROP(GETPROP_TF2SENTRYHEALTH,"CObjectSentrygun","m_iHealth",0);
 		DEFINE_GETPROP(GETPROP_TF2DISPENSERHEALTH,"CObjectDispenser","m_iHealth",0);

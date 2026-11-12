@@ -97,6 +97,14 @@ SH_DECL_HOOK1_void(IServerGameClients, ClientCommand, SH_NOATTRIB, 0, edict_t *)
 #endif
 
 SH_DECL_MANUALHOOK2_void(MHook_PlayerRunCmd, 0, 0, 0, CUserCmd*, IMoveHelper*);
+// DOD:S rocket owner crash guard (server.dll + 0x2a2ad4) - CDODPlayer vfunc
+// 0x570, one int argument (see Hook_DodWeaponGuard). Slot comes from
+// hookinfo.ini / rcbot_weapon_guard_dods, RECONFIGUREd in Load().
+SH_DECL_MANUALHOOK1_void(MHook_DodWeaponGuard, 0, 0, 0, int);
+
+// set in Load() once hookinfo + netprop offsets are known; gates ADD/REMOVE of
+// the guard hook in Hook_ClientPutInServer / Hook_ClientDisconnect
+static bool s_bDodWeaponGuardEnabled = false;
 
 IServerGameDLL *server = nullptr;
 IGameEventManager2 *gameevents = nullptr;
@@ -396,6 +404,117 @@ void RCBotPluginMeta::Hook_PlayerRunCmd(CUserCmd *ucmd, IMoveHelper *moveHelper)
 	RETURN_META(MRES_IGNORED);
 }
 
+// [crashfix] DoD:S rocket owner crash -- server.dll + 0x2a2ad4
+// (Accelerator IDs M4ER-I5AC-TEM6).
+//
+// Crash stack:
+//   Event_Killed -> SetState(STATE_DEATH_ANIM) -> CDODPlayer::vfunc0x56c
+//     -> CDODPlayer::vfunc0x570 (this hook; 0x101e1380, slot 348)
+//     -> weapon vfunc 0x3fc (0x102a2ab0, CWeaponBazooka/CWeaponPschreck)
+//         owner = resolve(weapon->m_hOwner)   // weapon+0x49c, may be null
+//         if (owner && owner->IsPlayer()) ok else owner = 0
+//         mov byte [owner + 0x1428], 0        // <-- unconditional: crash
+//
+// On death the game clears the weapon owner while m_hActiveWeapon still points
+// at the rocket launcher, so the write goes through a null pointer (MSVC UB
+// turned into a guaranteed crash). server.dll cannot be patched from here, so
+// before the original vfunc runs we validate the active weapon's m_hOwner
+// ourselves and, if it does not resolve to a live player, invalidate
+// m_hActiveWeapon. The original re-reads m_hActiveWeapon (0x100e07e0) and
+// takes its own null branch, so the weapon virtual is never dispatched.
+void RCBotPluginMeta::Hook_DodWeaponGuard(int arg)
+{
+	// `arg` is the bool the game passes to vfunc 0x570 (1 from the death path)
+	(void)arg;
+
+	static float s_flNextLog = 0.0f;
+
+	if ( servergameents == nullptr || gpGlobals == nullptr || engine == nullptr )
+		RETURN_META(MRES_IGNORED);
+
+	CBaseEntity *pPlayer = META_IFACEPTR(CBaseEntity);
+
+	if ( pPlayer == nullptr )
+		RETURN_META(MRES_IGNORED);
+
+	edict_t *pEdict = servergameents->BaseEntityToEdict(pPlayer);
+
+	if ( pEdict == nullptr )
+		RETURN_META(MRES_IGNORED);
+
+	CBaseHandle *pActive = CClassInterface::getActiveWeaponHandle(pEdict);
+
+	// netprop never resolved: never clear a weapon on a guess
+	if ( pActive == nullptr )
+		RETURN_META(MRES_IGNORED);
+
+	// no active weapon -> the original resolves null by itself
+	if ( !pActive->IsValid() )
+		RETURN_META(MRES_IGNORED);
+
+	const int iWeapon = pActive->GetEntryIndex();
+
+	// bound check before touching the entity list (invalid handles resolve to
+	// NUM_ENT_ENTRIES-1, which is past maxEntities)
+	if ( iWeapon < 1 || iWeapon >= gpGlobals->maxEntities )
+		RETURN_META(MRES_IGNORED);
+
+	edict_t *pWeaponEdict = engine->PEntityOfEntIndex(iWeapon);
+
+	if ( pWeaponEdict == nullptr || pWeaponEdict->GetUnknown() == nullptr ||
+		pWeaponEdict->GetUnknown()->GetBaseEntity() == nullptr )
+		RETURN_META(MRES_IGNORED);
+
+	// stale serial -> original resolves null as well
+	if ( pWeaponEdict->GetUnknown()->GetRefEHandle().ToInt() != pActive->ToInt() )
+		RETURN_META(MRES_IGNORED);
+
+	CBaseHandle *pOwner = CClassInterface::getWeaponOwnerHandle(pWeaponEdict);
+
+	// netprop never resolved: cannot tell a bad owner from a missing offset
+	if ( pOwner == nullptr )
+		RETURN_META(MRES_IGNORED);
+
+	bool bOwnerIsPlayer = false;
+
+	if ( pOwner->IsValid() )
+	{
+		const int iOwner = pOwner->GetEntryIndex();
+
+		// player edicts live in 1..maxClients, which also excludes worldspawn
+		// (0) and every non-player entity the game's own IsPlayer() test would
+		// reject - so the write at owner+0x1428 always has a live target
+		if ( iOwner >= 1 && iOwner <= gpGlobals->maxClients )
+		{
+			edict_t *pOwnerEdict = engine->PEntityOfEntIndex(iOwner);
+
+			if ( pOwnerEdict != nullptr && pOwnerEdict->GetUnknown() != nullptr )
+			{
+				IServerUnknown *pOwnerUnknown = pOwnerEdict->GetUnknown();
+
+				// serial number must match, otherwise the slot was reused
+				bOwnerIsPlayer = ( pOwnerUnknown->GetBaseEntity() != nullptr &&
+					pOwnerUnknown->GetRefEHandle().ToInt() == pOwner->ToInt() );
+			}
+		}
+	}
+
+	if ( bOwnerIsPlayer )
+		RETURN_META(MRES_IGNORED);
+
+	if ( CClassInterface::clearActiveWeapon(pEdict) && gpGlobals->curtime >= s_flNextLog )
+	{
+		s_flNextLog = gpGlobals->curtime + 5.0f;
+		logger->Log(LogLevel::WARN,
+			"[crashfix] client %d: active weapon owner invalid (owner idx %d, valid %d) -> cleared m_hActiveWeapon, avoided server.dll+0x2a2ad4",
+			IndexOfEdict(pEdict),
+			pOwner->IsValid() ? pOwner->GetEntryIndex() : -1,
+			pOwner->IsValid() ? 1 : 0);
+	}
+
+	RETURN_META(MRES_IGNORED);
+}
+
 /** 
  * Something like this is needed to register cvars/CON_COMMANDs.
  */
@@ -517,6 +636,17 @@ bool RCBotPluginMeta::Load(PluginId id, ISmmAPI *ismm, char *error, std::size_t 
 		rcbot_datamap_offset.SetValue(val);
 #endif
 
+#if SOURCE_ENGINE == SE_DODS
+	// CDODPlayer vtable slot of the weapon guard (server.dll+0x2a2ad4)
+#if defined(_WIN64) || defined(_WIN32)
+	if (kvl.getInt("weapon_guard_dods_win", &val))
+		rcbot_weapon_guard_dods.SetValue(val);
+#else
+	if (kvl.getInt("weapon_guard_dods_linux", &val))
+		rcbot_weapon_guard_dods.SetValue(val);
+#endif
+#endif
+
 	g_pGameRules_Obj = new CGameRulesObject(kvl, gameServerFactory);
 	g_pGameRules_Create_Obj = new CCreateGameRulesObject(kvl, gameServerFactory);
 
@@ -589,6 +719,34 @@ bool RCBotPluginMeta::Load(PluginId id, ISmmAPI *ismm, char *error, std::size_t 
 	//RandomSeed((unsigned)time(NULL));
 
 	CClassInterface::init();
+
+#if SOURCE_ENGINE == SE_DODS
+	// [crashfix] arm the DOD:S weapon guard (server.dll+0x2a2ad4). Both netprops
+	// must have resolved: without m_hOwner we cannot tell "owner is gone" from
+	// "offset lookup failed", and clearing m_hActiveWeapon on every call would
+	// strip every player of their weapon.
+	{
+		const int iSlot = rcbot_weapon_guard_dods.GetInt();
+		const unsigned iOwnerOffset = CClassInterface::getWeaponOwnerOffset();
+		const unsigned iActiveOffset = CClassInterface::getActiveWeaponOffset();
+
+		if ( iSlot > 0 && iOwnerOffset > 0 && iActiveOffset > 0 )
+		{
+			SH_MANUALHOOK_RECONFIGURE(MHook_DodWeaponGuard, iSlot, 0, 0);
+			s_bDodWeaponGuardEnabled = true;
+			logger->Log(LogLevel::WARN,
+				"[crashfix] DOD:S weapon guard ON: slot %d, m_hOwner=%u, m_hActiveWeapon=%u",
+				iSlot, iOwnerOffset, iActiveOffset);
+		}
+		else
+		{
+			s_bDodWeaponGuardEnabled = false;
+			logger->Log(LogLevel::ERROR,
+				"[crashfix] DOD:S weapon guard OFF: slot=%d m_hOwner=%u m_hActiveWeapon=%u",
+				iSlot, iOwnerOffset, iActiveOffset);
+		}
+	}
+#endif
 
 	RCBOT2_Cvar_setup(g_pCVar);
 
@@ -887,6 +1045,15 @@ void RCBotPluginMeta::Hook_ClientPutInServer(edict_t *pEntity, char const* playe
 		SH_ADD_MANUALHOOK_MEMFUNC(MHook_PlayerRunCmd, pEnt, this, &RCBotPluginMeta::Hook_PlayerRunCmd, false);
 	}
 #endif
+
+#if SOURCE_ENGINE == SE_DODS
+	// [crashfix] the victim of server.dll+0x2a2ad4 can be a human, so the
+	// guard is installed for every client (bots too)
+	if ( pEnt && s_bDodWeaponGuardEnabled )
+	{
+		SH_ADD_MANUALHOOK_MEMFUNC(MHook_DodWeaponGuard, pEnt, this, &RCBotPluginMeta::Hook_DodWeaponGuard, false);
+	}
+#endif
 }
 
 void RCBotPluginMeta::Hook_ClientDisconnect(edict_t *pEntity)
@@ -897,6 +1064,13 @@ void RCBotPluginMeta::Hook_ClientDisconnect(edict_t *pEntity)
 	if ( pEnt && !CBotGlobals::isMod(MOD_FF) )
 	{
 		SH_REMOVE_MANUALHOOK_MEMFUNC(MHook_PlayerRunCmd, pEnt, this, &RCBotPluginMeta::Hook_PlayerRunCmd, false);
+	}
+#endif
+
+#if SOURCE_ENGINE == SE_DODS
+	if ( pEnt && s_bDodWeaponGuardEnabled )
+	{
+		SH_REMOVE_MANUALHOOK_MEMFUNC(MHook_DodWeaponGuard, pEnt, this, &RCBotPluginMeta::Hook_DodWeaponGuard, false);
 	}
 #endif
 

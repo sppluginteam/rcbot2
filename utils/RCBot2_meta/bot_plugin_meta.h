@@ -93,6 +93,8 @@ public:
 	//Called for a game event.  Same definition as server plugins???
 	bool FireGameEvent( IGameEvent *pevent, bool bDontBroadcast );
 	void Hook_PlayerRunCmd(CUserCmd *ucmd, IMoveHelper *moveHelper);
+	// [crashfix] DOD:S rocket owner crash guard (server.dll+0x2a2ad4)
+	void Hook_DodWeaponGuard(int arg);
 	
 	bool Hook_ClientConnect(edict_t *pEntity, 
 		const char *pszName,

@@ -89,6 +89,10 @@ ConVar rcbot_debug_iglev("rcbot_debug_iglev", "0", 0, "bot think ignores functio
 ConVar rcbot_dont_move("rcbot_dont_move", "0", 0, "if 1 , bots will all move forward");
 
 ConVar rcbot_runplayercmd_dods("rcbot_runplayer_cmd_dods", "417", 0, "offset of the DOD:S PlayerRunCommand function");
+// CDODPlayer vtable slot for the DOD:S weapon guard (server.dll+0x2a2ad4 crash).
+// Default value is overwritten from hookinfo.ini (weapon_guard_dods_win/linux).
+// 0 disables the guard. See RCBotPluginMeta::Hook_DodWeaponGuard().
+ConVar rcbot_weapon_guard_dods("rcbot_weapon_guard_dods", "348", 0, "CDODPlayer vtable slot guarding the DOD:S rocket owner crash (0=off)");
 ConVar rcbot_ladder_offs("rcbot_ladder_offs", "42", 0, "difference in height for bot to think it has touched the ladder waypoint");
 ConVar rcbot_ffa("rcbot_ffa", "0", 0, "Free for all mode -- bots shoot everyone");
 ConVar rcbot_prone_enemy_only("rcbot_prone_enemy_only", "1", 0, "if 1 bots only prone in DOD:S when they have an enemy");
