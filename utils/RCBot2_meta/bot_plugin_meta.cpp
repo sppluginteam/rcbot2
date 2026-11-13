@@ -97,14 +97,60 @@ SH_DECL_HOOK1_void(IServerGameClients, ClientCommand, SH_NOATTRIB, 0, edict_t *)
 #endif
 
 SH_DECL_MANUALHOOK2_void(MHook_PlayerRunCmd, 0, 0, 0, CUserCmd*, IMoveHelper*);
-// DOD:S rocket owner crash guard (server.dll + 0x2a2ad4) - CDODPlayer vfunc
-// 0x570, one int argument (see Hook_DodWeaponGuard). Slot comes from
-// hookinfo.ini / rcbot_weapon_guard_dods, RECONFIGUREd in Load().
+// [crashfix] DOD:S rocket owner crash guard (server.dll + 0x2a2ad4).
+//
+// The crashing write happens in CDODBaseRocketWeapon::vfunc0x3fc, which is
+// dispatched from several CDODPlayer virtuals that all follow the same shape:
+//
+//   activeWeapon = GetActiveWeapon();       // player + 0x81c
+//   if (activeWeapon) activeWeapon->vfunc0x3fc(0);
+//
+// The two CDODPlayer slots that are reached by the death path are
+//   slot 376 (0x5e0 -> 0x101e36d0)  <- confirmed crash path (crash dump of
+//                                         the 2026-11-12 repro: server.dll
+//                                         +0x1e3776 -> +0x2a2ad4)
+//   slot 348 (0x570 -> 0x101e1380)  <- reached from CDODPlayer::vfunc0x56c
+//
+// Both take a single int argument, so both are hooked with the same handler.
+// The slots come from hookinfo.ini / rcbot_weapon_guard_dods[_b] and are
+// RECONFIGUREd in Load().
 SH_DECL_MANUALHOOK1_void(MHook_DodWeaponGuard, 0, 0, 0, int);
+SH_DECL_MANUALHOOK1_void(MHook_DodWeaponGuardB, 0, 0, 0, int);
 
 // set in Load() once hookinfo + netprop offsets are known; gates ADD/REMOVE of
 // the guard hook in Hook_ClientPutInServer / Hook_ClientDisconnect
 static bool s_bDodWeaponGuardEnabled = false;
+static bool s_bDodWeaponGuardEnabledB = false;
+
+// [crashfix] A/B instrumentation. The A/B logs proved "guard OFF crashes,
+// guard ON does not", but the handler counters showed calls=1 over 380 repro
+// kills, so "no crash" could not be attributed to the guard. These allow the
+// next run to distinguish "hook not on the instance" (H1) from "crash chain
+// entry never ran" (H2):
+//  - s_pOrigVtbl34x/37x: the vtable entries BEFORE the first guard hook was
+//    added (captured in Hook_ClientPutInServer). Any instance whose current
+//    entry differs from these has the SourceHook stub installed, i.e. a
+//    dispatch through that slot MUST reach Hook_DodWeaponGuard.
+//  - s_uGuardCalls/s_uGuardCleared: the handler's counters, moved to file
+//    scope so the GameFrame heartbeat can print them next to the install
+//    state.
+//  - the heartbeat (every 10s while the guard is on) prints one line with
+//    client count, hooked count per slot and the handler counters.
+static void *s_pOrigVtbl347 = nullptr;
+static void *s_pOrigVtbl348 = nullptr;
+static void *s_pOrigVtbl376 = nullptr;
+static bool s_bOrigVtblCaptured = false;
+static unsigned s_uGuardCalls = 0;
+static unsigned s_uGuardCleared = 0;
+static unsigned s_uGuardRetActiveInvalid = 0;
+static unsigned s_uGuardRetOwnerIsPlayer = 0;
+static unsigned s_uGuardRetNoProp = 0;
+static float s_flNextInstallProbe = 0.0f;
+
+// rcbot_loglevel is defined in rcbot/logging.cpp but not declared in
+// logging.h; the probe prints it so a silent logger can be ruled out as
+// a level filter
+extern ConVar rcbot_loglevel;
 
 IServerGameDLL *server = nullptr;
 IGameEventManager2 *gameevents = nullptr;
@@ -407,9 +453,9 @@ void RCBotPluginMeta::Hook_PlayerRunCmd(CUserCmd *ucmd, IMoveHelper *moveHelper)
 // [crashfix] DoD:S rocket owner crash -- server.dll + 0x2a2ad4
 // (Accelerator IDs M4ER-I5AC-TEM6).
 //
-// Crash stack:
-//   Event_Killed -> SetState(STATE_DEATH_ANIM) -> CDODPlayer::vfunc0x56c
-//     -> CDODPlayer::vfunc0x570 (this hook; 0x101e1380, slot 348)
+// Crash stack (verified with the minidump of the 2026-11-12 repro):
+//   RCBot2 -> CDODPlayer::vfunc0x428 (PlayerRunCommand, slot 425)
+//     -> ... -> CDODPlayer::vfunc0x5e0 (0x101e36d0, slot 376)
 //     -> weapon vfunc 0x3fc (0x102a2ab0, CWeaponBazooka/CWeaponPschreck)
 //         owner = resolve(weapon->m_hOwner)   // weapon+0x49c, may be null
 //         if (owner && owner->IsPlayer()) ok else owner = 0
@@ -422,12 +468,48 @@ void RCBotPluginMeta::Hook_PlayerRunCmd(CUserCmd *ucmd, IMoveHelper *moveHelper)
 // ourselves and, if it does not resolve to a live player, invalidate
 // m_hActiveWeapon. The original re-reads m_hActiveWeapon (0x100e07e0) and
 // takes its own null branch, so the weapon virtual is never dispatched.
+//
+// The same handler is installed on two CDODPlayer slots (376 = the confirmed
+// crash path, 348 = the other death path dispatch of the active weapon), so
+// whichever of them runs first neutralises the bad state for all the others.
+//
+// The counters below exist so an A/B run can tell "the guard fired and
+// neutralised the bad state" apart from "the repro never reached the hook":
+// without them a run with no crash proves nothing on its own.
 void RCBotPluginMeta::Hook_DodWeaponGuard(int arg)
 {
-	// `arg` is the bool the game passes to vfunc 0x570 (1 from the death path)
+	// `arg` is the int the game passes to the hooked vfunc (1 or 2 from the
+	// death path, see the disassembly above)
 	(void)arg;
 
 	static float s_flNextLog = 0.0f;
+	static float s_flNextProbe = 0.0f;
+
+	// counters live at file scope so the GameFrame heartbeat can report them
+	// next to the per-instance install state (see s_uGuardCalls)
+	unsigned &s_uCalls = s_uGuardCalls;
+	unsigned &s_uCleared = s_uGuardCleared;
+	unsigned &s_uRetActiveInvalid = s_uGuardRetActiveInvalid;
+	unsigned &s_uRetOwnerIsPlayer = s_uGuardRetOwnerIsPlayer;
+	unsigned &s_uRetNoProp = s_uGuardRetNoProp;
+
+	// logged at entry, before any early return, so a hook that only ever
+	// bails out still reports that it ran
+	++s_uCalls;
+
+	if ( gpGlobals != nullptr && gpGlobals->curtime >= s_flNextProbe )
+	{
+		s_flNextProbe = gpGlobals->curtime + 5.0f;
+		// META_LOG instead of logger->Log: on the 2026-11-13 A/B run the
+		// logger's Msg() output vanished from stdout after ~90s while
+		// META_LOG kept flowing for the whole session, which made the
+		// handler counters unreadable. META_LOG also lands in the engine
+		// log file, so the data survives either way.
+		META_LOG(g_PLAPI,
+			"[crashfix] guard probe: calls=%u cleared=%u ret_active_invalid=%u ret_owner_is_player=%u ret_no_prop=%u loglevel=%d",
+			s_uCalls, s_uCleared, s_uRetActiveInvalid, s_uRetOwnerIsPlayer, s_uRetNoProp,
+			rcbot_loglevel.GetInt());
+	}
 
 	if ( servergameents == nullptr || gpGlobals == nullptr || engine == nullptr )
 		RETURN_META(MRES_IGNORED);
@@ -446,11 +528,17 @@ void RCBotPluginMeta::Hook_DodWeaponGuard(int arg)
 
 	// netprop never resolved: never clear a weapon on a guess
 	if ( pActive == nullptr )
+	{
+		++s_uRetNoProp;
 		RETURN_META(MRES_IGNORED);
+	}
 
 	// no active weapon -> the original resolves null by itself
 	if ( !pActive->IsValid() )
+	{
+		++s_uRetActiveInvalid;
 		RETURN_META(MRES_IGNORED);
+	}
 
 	const int iWeapon = pActive->GetEntryIndex();
 
@@ -473,7 +561,10 @@ void RCBotPluginMeta::Hook_DodWeaponGuard(int arg)
 
 	// netprop never resolved: cannot tell a bad owner from a missing offset
 	if ( pOwner == nullptr )
+	{
+		++s_uRetNoProp;
 		RETURN_META(MRES_IGNORED);
+	}
 
 	bool bOwnerIsPlayer = false;
 
@@ -500,12 +591,23 @@ void RCBotPluginMeta::Hook_DodWeaponGuard(int arg)
 	}
 
 	if ( bOwnerIsPlayer )
+	{
+		++s_uRetOwnerIsPlayer;
 		RETURN_META(MRES_IGNORED);
+	}
 
-	if ( CClassInterface::clearActiveWeapon(pEdict) && gpGlobals->curtime >= s_flNextLog )
+	const bool bCleared = CClassInterface::clearActiveWeapon(pEdict);
+
+	if ( bCleared )
+		++s_uCleared;
+
+	if ( bCleared && gpGlobals->curtime >= s_flNextLog )
 	{
 		s_flNextLog = gpGlobals->curtime + 5.0f;
-		logger->Log(LogLevel::WARN,
+		// META_LOG: this is the line that proves the guard actually fired on
+		// the crash path, so it must not depend on the logger channel that
+		// went silent on the 2026-11-13 A/B run
+		META_LOG(g_PLAPI,
 			"[crashfix] client %d: active weapon owner invalid (owner idx %d, valid %d) -> cleared m_hActiveWeapon, avoided server.dll+0x2a2ad4",
 			IndexOfEdict(pEdict),
 			pOwner->IsValid() ? pOwner->GetEntryIndex() : -1,
@@ -637,13 +739,17 @@ bool RCBotPluginMeta::Load(PluginId id, ISmmAPI *ismm, char *error, std::size_t 
 #endif
 
 #if SOURCE_ENGINE == SE_DODS
-	// CDODPlayer vtable slot of the weapon guard (server.dll+0x2a2ad4)
+	// CDODPlayer vtable slots of the weapon guard (server.dll+0x2a2ad4)
 #if defined(_WIN64) || defined(_WIN32)
 	if (kvl.getInt("weapon_guard_dods_win", &val))
 		rcbot_weapon_guard_dods.SetValue(val);
+	if (kvl.getInt("weapon_guard_dods_b_win", &val))
+		rcbot_weapon_guard_dods_b.SetValue(val);
 #else
 	if (kvl.getInt("weapon_guard_dods_linux", &val))
 		rcbot_weapon_guard_dods.SetValue(val);
+	if (kvl.getInt("weapon_guard_dods_b_linux", &val))
+		rcbot_weapon_guard_dods_b.SetValue(val);
 #endif
 #endif
 
@@ -725,25 +831,57 @@ bool RCBotPluginMeta::Load(PluginId id, ISmmAPI *ismm, char *error, std::size_t 
 	// must have resolved: without m_hOwner we cannot tell "owner is gone" from
 	// "offset lookup failed", and clearing m_hActiveWeapon on every call would
 	// strip every player of their weapon.
+	//
+	// Two CDODPlayer slots are hooked, both of which dispatch the active
+	// weapon's vfunc0x3fc (the crashing one):
+	//   slot 376 (0x5e0) - confirmed crash path (minidump 2026-11-12)
+	//   slot 348 (0x570) - reached from CDODPlayer::vfunc0x56c
 	{
 		const int iSlot = rcbot_weapon_guard_dods.GetInt();
+		const int iSlotB = rcbot_weapon_guard_dods_b.GetInt();
 		const unsigned iOwnerOffset = CClassInterface::getWeaponOwnerOffset();
 		const unsigned iActiveOffset = CClassInterface::getActiveWeaponOffset();
 
-		if ( iSlot > 0 && iOwnerOffset > 0 && iActiveOffset > 0 )
+		if ( iOwnerOffset > 0 && iActiveOffset > 0 )
 		{
-			SH_MANUALHOOK_RECONFIGURE(MHook_DodWeaponGuard, iSlot, 0, 0);
-			s_bDodWeaponGuardEnabled = true;
-			logger->Log(LogLevel::WARN,
-				"[crashfix] DOD:S weapon guard ON: slot %d, m_hOwner=%u, m_hActiveWeapon=%u",
-				iSlot, iOwnerOffset, iActiveOffset);
+			s_bDodWeaponGuardEnabled = false;
+			s_bDodWeaponGuardEnabledB = false;
+
+			if ( iSlot > 0 )
+			{
+				SH_MANUALHOOK_RECONFIGURE(MHook_DodWeaponGuard, iSlot, 0, 0);
+				s_bDodWeaponGuardEnabled = true;
+			}
+
+			if ( iSlotB > 0 && iSlotB != iSlot )
+			{
+				SH_MANUALHOOK_RECONFIGURE(MHook_DodWeaponGuardB, iSlotB, 0, 0);
+				s_bDodWeaponGuardEnabledB = true;
+			}
+
+			if ( s_bDodWeaponGuardEnabled || s_bDodWeaponGuardEnabledB )
+			{
+				logger->Log(LogLevel::WARN,
+					"[crashfix] DOD:S weapon guard ON: slots %d%s%d, m_hOwner=%u, m_hActiveWeapon=%u",
+					iSlot,
+					s_bDodWeaponGuardEnabledB ? ", " : "",
+					s_bDodWeaponGuardEnabledB ? iSlotB : 0,
+					iOwnerOffset, iActiveOffset);
+			}
+			else
+			{
+				logger->Log(LogLevel::ERROR,
+					"[crashfix] DOD:S weapon guard OFF: no vtable slot configured (slot=%d slot_b=%d)",
+					iSlot, iSlotB);
+			}
 		}
 		else
 		{
 			s_bDodWeaponGuardEnabled = false;
+			s_bDodWeaponGuardEnabledB = false;
 			logger->Log(LogLevel::ERROR,
-				"[crashfix] DOD:S weapon guard OFF: slot=%d m_hOwner=%u m_hActiveWeapon=%u",
-				iSlot, iOwnerOffset, iActiveOffset);
+				"[crashfix] DOD:S weapon guard OFF: slot=%d/%d m_hOwner=%u m_hActiveWeapon=%u",
+				iSlot, iSlotB, iOwnerOffset, iActiveOffset);
 		}
 	}
 #endif
@@ -1049,9 +1187,48 @@ void RCBotPluginMeta::Hook_ClientPutInServer(edict_t *pEntity, char const* playe
 #if SOURCE_ENGINE == SE_DODS
 	// [crashfix] the victim of server.dll+0x2a2ad4 can be a human, so the
 	// guard is installed for every client (bots too)
+	if ( pEnt && (s_bDodWeaponGuardEnabled || s_bDodWeaponGuardEnabledB) )
+	{
+		// [crashfix] capture the pre-hook entries so later reads can tell
+		// "SourceHook stub installed" from "original server.dll target"
+		void **pVtblPre = *reinterpret_cast<void ***>(pEnt);
+
+		if ( !s_bOrigVtblCaptured && pVtblPre != nullptr )
+		{
+			s_pOrigVtbl347 = pVtblPre[347];
+			s_pOrigVtbl348 = pVtblPre[348];
+			s_pOrigVtbl376 = pVtblPre[376];
+			s_bOrigVtblCaptured = true;
+		}
+	}
+
 	if ( pEnt && s_bDodWeaponGuardEnabled )
 	{
 		SH_ADD_MANUALHOOK_MEMFUNC(MHook_DodWeaponGuard, pEnt, this, &RCBotPluginMeta::Hook_DodWeaponGuard, false);
+	}
+
+	if ( pEnt && s_bDodWeaponGuardEnabledB )
+	{
+		SH_ADD_MANUALHOOK_MEMFUNC(MHook_DodWeaponGuardB, pEnt, this, &RCBotPluginMeta::Hook_DodWeaponGuard, false);
+	}
+
+	// [crashfix] log what the instance's vtable looks like AFTER the ADD:
+	// a slot entry equal to the captured original means the hook is NOT on
+	// this instance (H1), a different value is the SourceHook stub
+	if ( pEnt && (s_bDodWeaponGuardEnabled || s_bDodWeaponGuardEnabledB) )
+	{
+		void **pVtbl = *reinterpret_cast<void ***>(pEnt);
+
+		if ( pVtbl != nullptr )
+		{
+			// META_LOG (see the guard probe comment): must reach the engine
+			// log file for every client, not just the first one
+			META_LOG(g_PLAPI,
+				"[crashfix] install: ent %d vtbl=%p s347=%p s348=%p s376=%p | orig347=%p orig348=%p orig376=%p",
+				IndexOfEdict(pEntity), pVtbl,
+				pVtbl[347], pVtbl[348], pVtbl[376],
+				s_pOrigVtbl347, s_pOrigVtbl348, s_pOrigVtbl376);
+		}
 	}
 #endif
 }
@@ -1072,6 +1249,11 @@ void RCBotPluginMeta::Hook_ClientDisconnect(edict_t *pEntity)
 	{
 		SH_REMOVE_MANUALHOOK_MEMFUNC(MHook_DodWeaponGuard, pEnt, this, &RCBotPluginMeta::Hook_DodWeaponGuard, false);
 	}
+
+	if ( pEnt && s_bDodWeaponGuardEnabledB )
+	{
+		SH_REMOVE_MANUALHOOK_MEMFUNC(MHook_DodWeaponGuardB, pEnt, this, &RCBotPluginMeta::Hook_DodWeaponGuard, false);
+	}
 #endif
 
 	CClients::clientDisconnected(pEntity);
@@ -1091,6 +1273,60 @@ void RCBotPluginMeta::Hook_GameFrame(const bool simulating)
 	 * true  | game is ticking
 	 * false | game is not ticking
 	 */
+
+#if SOURCE_ENGINE == SE_DODS
+	// [crashfix] A/B heartbeat: one line every 10s while the guard is on,
+	// pairing the handler counters with the per-instance install state, so a
+	// run can show "hooks are on every client AND the handler fires" (guard
+	// works) vs "hooks are on but the crash chain never entered" (H2)
+	if ( (s_bDodWeaponGuardEnabled || s_bDodWeaponGuardEnabledB) &&
+		gpGlobals != nullptr && s_bOrigVtblCaptured &&
+		gpGlobals->curtime >= s_flNextInstallProbe )
+	{
+		s_flNextInstallProbe = gpGlobals->curtime + 10.0f;
+
+		unsigned uClients = 0, uHooked347 = 0, uHooked348 = 0, uHooked376 = 0, uVptrDiff = 0;
+		void **pFirstVtbl = nullptr;
+
+		for ( int i = 1; i <= gpGlobals->maxClients; ++i )
+		{
+			edict_t *pEd = engine->PEntityOfEntIndex(i);
+
+			if ( pEd == nullptr || pEd->IsFree() )
+				continue;
+
+			CBaseEntity *pBase = servergameents->EdictToBaseEntity(pEd);
+
+			if ( pBase == nullptr )
+				continue;
+
+			void **pV = *reinterpret_cast<void ***>(pBase);
+
+			if ( pV == nullptr )
+				continue;
+
+			++uClients;
+
+			if ( pFirstVtbl == nullptr )
+				pFirstVtbl = pV;
+			else if ( pV != pFirstVtbl )
+				++uVptrDiff;
+
+			if ( pV[347] != s_pOrigVtbl347 ) ++uHooked347;
+			if ( pV[348] != s_pOrigVtbl348 ) ++uHooked348;
+			if ( pV[376] != s_pOrigVtbl376 ) ++uHooked376;
+		}
+
+		// META_LOG: the heartbeat is the primary H1/H2 evidence and must
+		// keep flowing for the whole session (see the guard probe comment)
+		META_LOG(g_PLAPI,
+			"[crashfix] install probe: clients=%u hooked347=%u hooked348=%u hooked376=%u vptrDiff=%u | calls=%u cleared=%u ret_active_invalid=%u ret_owner_is_player=%u ret_no_prop=%u | vtbl348=%p orig348=%p",
+			uClients, uHooked347, uHooked348, uHooked376, uVptrDiff,
+			s_uGuardCalls, s_uGuardCleared, s_uGuardRetActiveInvalid,
+			s_uGuardRetOwnerIsPlayer, s_uGuardRetNoProp,
+			pFirstVtbl ? pFirstVtbl[348] : nullptr, s_pOrigVtbl348);
+	}
+#endif
 
 	if ( simulating && CBotGlobals::IsMapRunning() )
 	{

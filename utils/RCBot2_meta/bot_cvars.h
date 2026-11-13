@@ -73,6 +73,7 @@ extern ConVar rcbot_debug_iglev;
 extern ConVar rcbot_dont_move;
 extern ConVar rcbot_runplayercmd_dods;
 extern ConVar rcbot_weapon_guard_dods;
+extern ConVar rcbot_weapon_guard_dods_b;
 extern ConVar rcbot_ladder_offs;
 extern ConVar rcbot_ffa;
 extern ConVar rcbot_prone_enemy_only;
