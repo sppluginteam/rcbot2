@@ -393,11 +393,21 @@ bool CBotVisibles::isVisible(const edict_t* pEdict) const
 	VPROF_BUDGET("CBotVisibles::isVisible", "RCBot2")
 #endif // RCBOT_VPROF_ENABLED
 
-    const int iIndex = ENTINDEX(pEdict) - 1;
-    const std::size_t iByte = static_cast<std::size_t>(iIndex / 8); // Use size_t for indexing [APG]RoboCop[CL]
-    const int iBit = iIndex % 8;
+    // [crashfix] validate the edict BEFORE computing a bit index. A stale /
+    // freed edict (or one restored from a netprop handle) can carry an index
+    // beyond the bitmap that was sized at bot-creation time; reading/writing
+    // it corrupts the heap. ENTINDEX 0 (world) yields iIndex=-1 -> UB.
+    if (pEdict == nullptr || pEdict->IsFree())
+        return false;
 
-    if (iIndex < 0 || iByte > m_iMaxSize)
+    const int iEntIndex = ENTINDEX(pEdict);
+    if (iEntIndex <= 0 || iEntIndex > m_iMaxIndex)
+        return false;
+
+    const int iIndex = iEntIndex - 1;
+    const std::size_t iByte = static_cast<std::size_t>(iIndex) >> 3;
+    const int iBit = iIndex & 7;
+    if (iByte >= static_cast<std::size_t>(m_iMaxSize))
         return false;
 
     return (m_iIndicesVisible[iByte] & (1 << iBit)) != 0;
@@ -405,9 +415,23 @@ bool CBotVisibles::isVisible(const edict_t* pEdict) const
 
 void CBotVisibles::setVisible(edict_t* pEdict, const bool bVisible)
 {
-    const int iIndex = ENTINDEX(pEdict) - 1;
-	const std::size_t iByte = static_cast<std::size_t>(iIndex / 8); // Use size_t for indexing [APG]RoboCop[CL]
-    const int iBit = iIndex % 8;
+    // [crashfix] the write path had NO bounds check at all. An out-of-range
+    // edict wrote past m_iIndicesVisible and smashed the heap; the adjacent
+    // std::set insert/erase then tripped RtlpFreeHeap with an int 3. Mirror
+    // the validation from isVisible() here so no write can escape the bitmap.
+    if (pEdict == nullptr || pEdict->IsFree())
+        return;
+
+    const int iEntIndex = ENTINDEX(pEdict);
+    if (iEntIndex <= 0 || iEntIndex > m_iMaxIndex)
+        return;
+
+    const int iIndex = iEntIndex - 1;
+    const std::size_t iByte = static_cast<std::size_t>(iIndex) >> 3;
+    if (iByte >= static_cast<std::size_t>(m_iMaxSize))
+        return;
+
+    const int iBit = iIndex & 7;
     const int iFlag = 1 << iBit;
 
     if (bVisible)
@@ -421,7 +445,7 @@ void CBotVisibles::setVisible(edict_t* pEdict, const bool bVisible)
     else
     {
         // not visible anymore
-        if (pEdict && (m_iIndicesVisible[iByte] & iFlag) == iFlag)
+        if ((m_iIndicesVisible[iByte] & iFlag) == iFlag)
             m_VisibleSet.erase(pEdict);
 
         m_iIndicesVisible[iByte] &= ~iFlag;
