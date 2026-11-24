@@ -1548,6 +1548,15 @@ void CDODBot :: modThink ()
 	m_iClass = static_cast<DOD_Class>(CClassInterface::getPlayerClassDOD(m_pEdict));	
 	m_iTeam = getTeam();
 
+	// [crashfix] m_pWeapons can be null when the bot's weapon list is being
+	// torn down (class change, death/respawn, or a bomb detonation on a bomb
+	// map that clears the inventory mid-frame). hasWeapon() would then
+	// dereference a null pointer and crash the server. Guard the whole
+	// weapon-dependent block; the bot re-populates m_pWeapons on its next
+	// spawnInit() and resumes normally.
+	if ( m_pWeapons == nullptr )
+		return;
+
 	m_bHasBomb = m_pWeapons->hasWeapon(DOD_WEAPON_BOMB);
 
 	if ( m_iTeam == TEAM_ALLIES ) // im allies
